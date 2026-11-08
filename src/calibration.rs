@@ -14,10 +14,23 @@ pub const BRIEF_TEMPLATE: &str = include_str!("../skills/superagent/brief.md");
 
 pub const HARNESSES: &[&str] = &["claude", "codex", "pi"];
 
+/// Where harnesses usually live when a non-login shell (such as a herdr pane) lacks them on PATH.
+pub const COMMON_BIN_DIRS: &[&str] = &[
+    "~/.local/bin",
+    "~/.npm-global/bin",
+    "~/.cargo/bin",
+    "~/.opencode/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HarnessInfo {
     pub name: String,
     pub installed: bool,
+    /// Found on this process's PATH (a herdr pane may lack the shell's PATH).
+    pub on_path: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// MCP servers configured for this harness; `None` when the layout is unknown.
@@ -47,6 +60,8 @@ pub struct Doctor {
     pub repos: Vec<RepoInfo>,
     pub state_repo: String,
     pub superagent_on_path: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superagent_path: Option<String>,
 }
 
 fn which(name: &str) -> Option<String> {
@@ -55,6 +70,18 @@ fn which(name: &str) -> Option<String> {
         .map(|dir| dir.join(name))
         .find(|p| p.is_file())
         .map(|p| p.display().to_string())
+}
+
+/// `which`, then the usual install directories: (path, on_path).
+pub fn locate(name: &str) -> Option<(String, bool)> {
+    if let Some(path) = which(name) {
+        return Some((path, true));
+    }
+    COMMON_BIN_DIRS
+        .iter()
+        .map(|dir| Path::new(&expand_home(dir)).join(name))
+        .find(|p| p.is_file())
+        .map(|p| (p.display().to_string(), false))
 }
 
 fn run(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
@@ -147,11 +174,22 @@ pub fn doctor(profile: &Profile) -> Doctor {
     let harnesses = HARNESSES
         .iter()
         .map(|name| {
-            let path = which(name);
-            let (mcp_servers, note) = if path.is_some() { mcp_servers(name, &home) } else { (None, None) };
+            let found = locate(name);
+            let (path, on_path) = match &found {
+                Some((p, on)) => (Some(p.clone()), *on),
+                None => (None, false),
+            };
+            let (mcp_servers, mut note) = if on_path { mcp_servers(name, &home) } else { (None, None) };
+            if found.is_some() && !on_path {
+                note = Some(format!(
+                    "installed at {} but not on this pane's PATH; `start` now passes your shell's PATH to new panes",
+                    path.clone().unwrap_or_default()
+                ));
+            }
             HarnessInfo {
                 name: name.to_string(),
-                installed: path.is_some(),
+                installed: found.is_some(),
+                on_path,
                 path,
                 mcp_servers,
                 note,
@@ -188,6 +226,7 @@ pub fn doctor(profile: &Profile) -> Doctor {
         repos,
         state_repo: profile.state_repo.kind.clone(),
         superagent_on_path: which("herdr-superagent").is_some(),
+        superagent_path: locate("herdr-superagent").map(|(p, _)| p),
     }
 }
 

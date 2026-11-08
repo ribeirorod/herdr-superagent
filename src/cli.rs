@@ -730,8 +730,14 @@ fn doctor_text(report: &crate::calibration::Doctor) -> String {
         lines.push(format!(
             "  {:<7} {}{}{}",
             h.name,
-            if h.installed { "installed" } else { "not installed" },
-            if h.installed { format!(" · {mcp}") } else { String::new() },
+            if h.installed && h.on_path {
+                "installed"
+            } else if h.installed {
+                "installed, NOT on PATH"
+            } else {
+                "not installed"
+            },
+            if h.on_path { format!(" · {mcp}") } else { String::new() },
             h.note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()
         ));
     }
