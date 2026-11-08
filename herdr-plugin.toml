@@ -1,0 +1,38 @@
+id = "ribeirorod.superagent"
+name = "Superagent"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "One superagent session that routes your requests into tickets, runs workers in herdr panes and lets you review."
+platforms = ["linux", "macos"]
+
+# Fetches the prebuilt binary for this platform into bin/ (or builds it with
+# cargo when no release asset exists), then links it into ~/.local/bin so
+# `herdr-superagent` is on PATH for workers and for herdr's resume command.
+[[build]]
+command = ["sh", "scripts/install-binary.sh"]
+
+# Idempotent: creates the superagent workspace and daemon pane when missing,
+# restarts a daemon whose version differs from the installed binary.
+[[startup]]
+command = ["bin/herdr-superagent", "ensure"]
+
+[[actions]]
+id = "start"
+title = "Superagent: open cockpit"
+description = "Open the superagent workspace for the current profile, starting what is missing."
+contexts = ["workspace"]
+command = ["bin/herdr-superagent", "action"]
+
+[[actions]]
+id = "submit"
+title = "Superagent: submit selection as a request"
+description = "Hand the selected text to the superagent as a request, with the pane's directory as the project."
+contexts = ["pane"]
+command = ["bin/herdr-superagent", "action"]
+
+[[actions]]
+id = "status"
+title = "Superagent: status"
+description = "Tickets by stage, candidates waiting for routing and pending effects."
+contexts = ["workspace"]
+command = ["bin/herdr-superagent", "action"]
