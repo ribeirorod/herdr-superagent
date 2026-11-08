@@ -189,7 +189,7 @@ impl Engine {
         };
         if !self.policy().revalidate(&ticket.mandate) {
             // The mandate no longer holds: what waited goes back to evaluation.
-            let waiting: Vec<String> = ticket.undelivered.drain(..).collect();
+            let waiting: Vec<String> = std::mem::take(&mut ticket.undelivered);
             self.repo().ticket_save(&ticket);
             for id in waiting {
                 if let Some(TicketInput::Request {
