@@ -92,6 +92,19 @@ impl Herdr {
 
     /// Sends one request and returns its `result`, or the API error.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
+        let started = std::time::Instant::now();
+        let result = self.call_inner(method, &params);
+        let ms = started.elapsed().as_millis();
+        match &result {
+            Ok(value) => {
+                tracing::debug!(target: "herdr", method, ms, params = %params, result = %truncate(&value.to_string(), 2000), "herdr ok")
+            }
+            Err(error) => tracing::debug!(target: "herdr", method, ms, params = %params, %error, "herdr error"),
+        }
+        result
+    }
+
+    fn call_inner(&self, method: &str, params: &Value) -> Result<Value, HerdrError> {
         #[cfg(unix)]
         {
             use std::os::unix::net::UnixStream;
@@ -232,6 +245,13 @@ impl Herdr {
             params["body"] = Value::String(body.to_string());
         }
         self.call("notification.show", params).map(|_| ())
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((i, _)) => format!("{}… ({} bytes)", &text[..i], text.len()),
+        None => text.to_string(),
     }
 }
 

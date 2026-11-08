@@ -13,6 +13,7 @@ mod ensure;
 #[allow(dead_code)]
 mod herdr;
 mod ipc;
+mod logging;
 mod paths;
 mod profile;
 mod session;
@@ -22,14 +23,24 @@ mod store;
 use clap::Parser;
 
 fn main() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_env("HERDR_SUPERAGENT_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
     let cli = cli::Cli::parse();
+    let profile = cli.profile.clone().unwrap_or_else(|| paths::DEFAULT_PROFILE.to_string());
+    let debug = logging::debug_enabled(cli.debug);
+    if debug {
+        // Children (the daemon pane, actions) inherit the mode.
+        std::env::set_var("HERDR_SUPERAGENT_DEBUG", "1");
+    }
+    let process = match cli.command {
+        cli::Command::Daemon => "daemon",
+        cli::Command::Ensure | cli::Command::Start(_) | cli::Command::Action => "ensure",
+        _ => "cli",
+    };
+    if paths::validate_profile(&profile).is_ok() {
+        let paths = paths::Paths::for_profile(&profile);
+        let _ = paths.ensure_dirs();
+        logging::rotate(&logging::log_file(&paths, process), 20 * 1024 * 1024);
+        logging::init(&paths, process, debug);
+    }
     match cli::run(cli) {
         Ok(code) => std::process::exit(code),
         Err(message) => {

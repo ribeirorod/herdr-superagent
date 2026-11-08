@@ -71,6 +71,10 @@ impl Paths {
     pub fn daemon_info_path(&self) -> PathBuf {
         self.state_dir().join("daemon.json")
     }
+    /// One log file per process kind: `daemon.log`, `cli.log`, `ensure.log`.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.state_dir().join("logs")
+    }
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.profile_dir())?;
         std::fs::create_dir_all(self.state_dir())?;

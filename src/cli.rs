@@ -23,6 +23,9 @@ pub struct Cli {
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Debug mode: log every herdr request, daemon call and effect to the per-process log files.
+    #[arg(long, global = true)]
+    pub debug: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -41,6 +44,23 @@ pub enum Command {
     Sync,
     /// Rebuild the local database from the state repo's ticket records.
     Reindex,
+    /// Show the log files: `logs`, `logs --process daemon --lines 200`, `logs --follow`.
+    Logs {
+        /// daemon, cli, ensure or all.
+        #[arg(long, default_value = "all")]
+        process: String,
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
+        /// Keep printing new lines (like tail -f).
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Collect logs, daemon state, profile, doctor and the herdr snapshot into one archive to share.
+    DebugBundle {
+        /// Where to write the archive (default: ~/herdr-superagent-debug-<profile>-<time>.tar.gz).
+        #[arg(long)]
+        output: Option<String>,
+    },
     /// The daemon's status: tickets by stage, pending candidates and effects.
     Status,
     /// Run the daemon in the foreground (herdr runs this in the daemon pane).
@@ -256,6 +276,67 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         Command::Reindex => {
             let value = daemon("reindex", json!({}))?;
             out(value.clone(), format!("reindexed {} tickets", value["tickets"]))
+        }
+        Command::Logs { process, lines, follow } => {
+            let files: Vec<std::path::PathBuf> = if process == "all" {
+                let mut list: Vec<_> = std::fs::read_dir(paths.logs_dir())
+                    .map(|d| {
+                        d.filter_map(Result::ok)
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().map(|e| e == "log").unwrap_or(false))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                list.sort();
+                list
+            } else {
+                vec![crate::logging::log_file(&paths, &process)]
+            };
+            if files.is_empty() {
+                return Err(format!("no logs yet under {}", paths.logs_dir().display()));
+            }
+            for file in &files {
+                println!("==> {} <==", file.display());
+                let text = std::fs::read_to_string(file).unwrap_or_default();
+                let all: Vec<&str> = text.lines().collect();
+                for line in &all[all.len().saturating_sub(lines)..] {
+                    println!("{line}");
+                }
+            }
+            if follow {
+                let mut offsets: Vec<u64> = files.iter().map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0)).collect();
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    for (file, offset) in files.iter().zip(offsets.iter_mut()) {
+                        let Ok(len) = std::fs::metadata(file).map(|m| m.len()) else {
+                            continue;
+                        };
+                        if len > *offset {
+                            use std::io::{Read, Seek};
+                            if let Ok(mut f) = std::fs::File::open(file) {
+                                let _ = f.seek(std::io::SeekFrom::Start(*offset));
+                                let mut buf = String::new();
+                                let _ = f.read_to_string(&mut buf);
+                                print!("{buf}");
+                            }
+                            *offset = len;
+                        } else if len < *offset {
+                            *offset = 0;
+                        }
+                    }
+                }
+            }
+            Ok(0)
+        }
+        Command::DebugBundle { output } => {
+            let value = debug_bundle(&profile, &paths, output)?;
+            out(
+                value.clone(),
+                format!(
+                    "wrote {}\nshare this file; it holds logs, daemon.json, profile.toml, doctor, status, tickets and the herdr snapshot (no credentials)",
+                    value["archive"].as_str().unwrap_or("")
+                ),
+            )
         }
         Command::Status => {
             let status = daemon("status", json!({}))?;
@@ -543,6 +624,92 @@ fn action(profile: &str, paths: &Paths) -> Result<i32, String> {
         }
         other => Err(format!("unknown action '{other}'")),
     }
+}
+
+/// Collects everything needed to debug a session into one tar.gz.
+fn debug_bundle(profile: &str, paths: &Paths, output: Option<String>) -> Result<Value, String> {
+    let stamp = crate::core::clock::now_iso().replace([':', '.'], "-");
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let archive = output.unwrap_or_else(|| format!("{home}/herdr-superagent-debug-{profile}-{stamp}.tar.gz"));
+    let dir = std::env::temp_dir().join(format!("herdr-superagent-debug-{profile}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let copy = |from: &std::path::Path, name: &str| {
+        if from.is_file() {
+            let _ = std::fs::copy(from, dir.join(name));
+        }
+    };
+    let write = |name: &str, text: String| {
+        let _ = std::fs::write(dir.join(name), text);
+    };
+    if let Ok(entries) = std::fs::read_dir(paths.logs_dir()) {
+        for entry in entries.filter_map(Result::ok) {
+            copy(&entry.path(), &entry.file_name().to_string_lossy());
+        }
+    }
+    copy(&paths.daemon_info_path(), "daemon.json");
+    copy(&paths.profile_file(), "profile.toml");
+    copy(&paths.profile_dir().join("calibration.md"), "calibration.md");
+    let loaded = crate::profile::Profile::load_or_init(&paths.profile_file())?;
+    write(
+        "doctor.json",
+        serde_json::to_string_pretty(&crate::calibration::doctor(&loaded)).unwrap_or_default(),
+    );
+    let status = ipc::call(&paths.socket_path(), "status", json!({}), Duration::from_secs(5))
+        .map(|v| v.to_string())
+        .unwrap_or_else(|e| format!("daemon not reachable: {e}"));
+    write("status.json", status);
+    let tickets = ipc::call(&paths.socket_path(), "tickets", json!({ "all": true }), Duration::from_secs(5))
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+        .unwrap_or_default();
+    write("tickets.json", tickets);
+    let herdr = match crate::herdr::Herdr::from_env() {
+        Ok(h) => {
+            let snapshot = h
+                .call("session.snapshot", json!({}))
+                .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+                .unwrap_or_else(|e| e.to_string());
+            write("herdr-snapshot.json", snapshot);
+            let plugins = h
+                .call("plugin.list", json!({}))
+                .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+                .unwrap_or_else(|e| e.to_string());
+            write("herdr-plugins.json", plugins);
+            format!("socket {} version {}", h.socket_path().display(), h.ping().unwrap_or_default())
+        }
+        Err(e) => e.to_string(),
+    };
+    let env: Vec<String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("HERDR_") || k.starts_with("SUPERAGENT_"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    write(
+        "environment.txt",
+        format!(
+            "herdr-superagent {}\nprofile {}\nos {} {}\nherdr: {}\nmachine {}\nbinary {}\non PATH: {}\n\n{}\n",
+            crate::daemon::VERSION,
+            profile,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            herdr,
+            crate::staterepo::machine_name(),
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+            crate::daemon::on_path("herdr-superagent"),
+            env.join("\n")
+        ),
+    );
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(dir.parent().unwrap_or(&dir))
+        .arg(dir.file_name().unwrap_or_default())
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !status.success() {
+        return Err("tar failed".into());
+    }
+    Ok(json!({ "archive": archive }))
 }
 
 fn doctor_text(report: &crate::calibration::Doctor) -> String {

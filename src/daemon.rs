@@ -247,6 +247,7 @@ impl Daemon {
         if resume.is_none() {
             tracing::warn!("herdr-superagent is not on PATH: herdr cannot resume the daemon after a restart");
         }
+        tracing::debug!(target: "daemon", pane, state, %message, resume = ?resume, "reporting state to herdr");
         if let Err(e) = herdr.report_agent(pane, state, &message, herdr::seq_now(), resume.as_deref()) {
             tracing::warn!(%e, "pane.report_agent failed");
         } else if force {
@@ -339,7 +340,14 @@ impl Daemon {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("").to_string();
                 let params = request.get("params").cloned().unwrap_or(json!({}));
-                match self.dispatch(&method, &params) {
+                let started = Instant::now();
+                let outcome = self.dispatch(&method, &params);
+                let ms = started.elapsed().as_millis();
+                match &outcome {
+                    Ok(result) => tracing::debug!(target: "daemon", method = %method, ms, params = %params, result = %result, "request ok"),
+                    Err(error) => tracing::info!(target: "daemon", method = %method, ms, params = %params, %error, "request refused"),
+                }
+                match outcome {
                     Ok(result) => json!({ "id": id, "result": result }),
                     Err(error) => {
                         json!({ "id": id, "error": { "code": error.code_name(), "message": error.message(), "missing": error.missing() } })
@@ -481,6 +489,7 @@ impl Daemon {
         let now_ms = herdr::seq_now() as i64;
         for (kind, handler) in &self.handlers {
             for effect in self.store.effects_due(kind, now_ms, 8) {
+                tracing::debug!(target: "daemon", kind, key = %effect.key, attempts = effect.attempts, payload = %effect.payload, "running effect");
                 match handler(self, &effect) {
                     Ok(()) => {
                         self.store.effect_done(kind, &effect.key, effect.generation);

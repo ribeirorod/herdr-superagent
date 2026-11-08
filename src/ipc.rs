@@ -33,6 +33,17 @@ impl std::error::Error for IpcError {}
 
 /// Sends one request to the daemon behind `socket`.
 pub fn call(socket: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value, IpcError> {
+    let started = std::time::Instant::now();
+    let result = call_inner(socket, method, &params, timeout);
+    let ms = started.elapsed().as_millis();
+    match &result {
+        Ok(value) => tracing::debug!(target: "ipc", method, ms, params = %params, result = %value, "daemon ok"),
+        Err(error) => tracing::debug!(target: "ipc", method, ms, params = %params, %error, "daemon error"),
+    }
+    result
+}
+
+fn call_inner(socket: &Path, method: &str, params: &Value, timeout: Duration) -> Result<Value, IpcError> {
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixStream;

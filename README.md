@@ -60,6 +60,41 @@ Workers are **not launched yet**: the engine records every launch, delivery
 and stop as a durable effect, and phase 2 runs them in herdr panes. Until then
 `status` lists the effects waiting for an executor.
 
+## Testing a checkout in your herdr
+
+```bash
+git clone https://github.com/ribeirorod/herdr-superagent ~/src/herdr-superagent
+cd ~/src/herdr-superagent
+cargo build --release
+mkdir -p bin ~/.local/bin
+cp target/release/herdr-superagent bin/
+ln -sf "$PWD/bin/herdr-superagent" ~/.local/bin/herdr-superagent   # must be on PATH
+herdr plugin link ~/src/herdr-superagent                            # from a herdr pane
+herdr-superagent --debug start --profile test
+```
+
+Rebuild and `herdr-superagent ensure` after pulling: the daemon notices the
+new version and restarts itself in its pane.
+
+## Debugging
+
+`--debug` (or `HERDR_SUPERAGENT_DEBUG=1`) makes every process log at debug
+level: each herdr request and response, each daemon call, each effect, the
+state reports to herdr and the daemon's own decisions. Logs go to one file per
+process kind under `~/.local/share/herdr-superagent/profiles/<profile>/logs/`
+(`daemon.log`, `cli.log`, `ensure.log`), rotated at 20 MB.
+
+```bash
+herdr-superagent --profile test logs --follow             # tail everything
+herdr-superagent --profile test logs --process daemon --lines 500
+herdr-superagent --profile test debug-bundle              # one tar.gz to share
+```
+
+The bundle holds the logs, `daemon.json`, `profile.toml`, `calibration.md`,
+`doctor`, `status`, all tickets, the herdr session snapshot and the plugin
+list, plus the `HERDR_*`/`SUPERAGENT_*` environment. It never includes
+credentials or MCP configs.
+
 ## Development
 
 ```bash

@@ -95,8 +95,10 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
 
     let label = workspace_label(profile_name);
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let env = [("SUPERAGENT_PROFILE", profile_name)];
+    let debug_flag = if crate::logging::debug_enabled(false) { "1" } else { "" };
+    let env = [("SUPERAGENT_PROFILE", profile_name), ("HERDR_SUPERAGENT_DEBUG", debug_flag)];
     let command = daemon_command(profile_name);
+    tracing::debug!(target: "ensure", ?command, debug_mode = debug_flag, "daemon command");
     match find_workspace(&herdr, profile_name)? {
         None => {
             let (workspace_id, root_pane) = herdr.workspace_create(&home, &label, &env, focus).map_err(|e| e.to_string())?;
@@ -164,12 +166,14 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
 /// The cockpit (PLAN §8b): the superagent session on the left, the daemon on
 /// the right. Phase 6 replaces the daemon pane's output with the dashboard.
 fn cockpit_layout(profile: &str, home: &str, state_dir: &str, daemon_command: &[String]) -> Value {
+    let debug = if crate::logging::debug_enabled(false) { "1" } else { "" };
+    let env = |role: &str| json!({ "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": role, "HERDR_SUPERAGENT_DEBUG": debug });
     json!({
         "type": "split",
         "direction": "right",
         "ratio": 0.65,
-        "first": { "type": "pane", "label": "superagent", "cwd": home, "env": { "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": "superagent" } },
-        "second": { "type": "pane", "label": "daemon", "cwd": state_dir, "command": daemon_command, "env": { "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": "daemon" } }
+        "first": { "type": "pane", "label": "superagent", "cwd": home, "env": env("superagent") },
+        "second": { "type": "pane", "label": "daemon", "cwd": state_dir, "command": daemon_command, "env": env("daemon") }
     })
 }
 
