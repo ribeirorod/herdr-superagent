@@ -22,11 +22,14 @@ use crate::core::stage::ticket_stage;
 use crate::herdr::{self, Herdr};
 use crate::paths::Paths;
 use crate::profile::{Profile, ProfilePolicy};
+use crate::staterepo::{StateRepo, RENEW_SECONDS};
 use crate::store::sqlite::{Effect, SqliteStore};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TICK: Duration = Duration::from_secs(2);
 const REPORT_REFRESH: Duration = Duration::from_secs(60);
+/// Commits to the state repo are batched (PLAN §8a: at most once a minute).
+const COMMIT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The executor port, as a durable effect queue: the engine queues work inside
 /// its transaction, the daemon runs it after the commit (prototype `Effects`).
@@ -92,6 +95,13 @@ struct Daemon {
     started_at: String,
     last_report: RefCell<(String, Instant)>,
     handlers: HashMap<&'static str, EffectHandler>,
+    /// Domain events since the last tick, for the ticket records.
+    events: Rc<RefCell<Vec<DomainEvent>>>,
+    state_repo: RefCell<Option<StateRepo>>,
+    dirty_tickets: RefCell<std::collections::BTreeSet<String>>,
+    last_commit: Cell<Instant>,
+    last_renew: Cell<Instant>,
+    profile_mtime: Cell<Option<std::time::SystemTime>>,
 }
 
 /// Runs one due effect; `Err` schedules a retry with backoff.
@@ -113,18 +123,45 @@ pub fn run(profile_name: &str) -> Result<(), String> {
     }
     let _ = std::fs::remove_file(paths.socket_path());
 
+    let fresh_db = !paths.db_path().exists();
     let store = Rc::new(SqliteStore::open(&paths.db_path()).map_err(|e| e.to_string())?);
+    let state_repo = StateRepo::open_or_init(&profile, &paths.profile_dir())?;
+    if let Some(repo) = &state_repo {
+        // `start` takes the lease before launching the daemon; a daemon that
+        // finds another live machine on it must not run.
+        let me = crate::staterepo::machine_name();
+        if let Some(lease) = repo.lease() {
+            if lease.machine != me && lease.expires > clock::now_iso() {
+                return Err(format!(
+                    "profile '{profile_name}' is running on '{}' (lease until {}); use `herdr-superagent start --take-over` to move it here",
+                    lease.machine, lease.expires
+                ));
+            }
+        }
+        if let Err(e) = repo.acquire(false) {
+            tracing::warn!(%e, "could not take the lease");
+        }
+    }
+    if let (true, Some(repo)) = (fresh_db, &state_repo) {
+        match repo.reindex(store.as_ref()) {
+            Ok(n) => tracing::info!(tickets = n, "rebuilt the database from the state repo"),
+            Err(e) => tracing::warn!(%e, "reindex failed"),
+        }
+    }
     let policy = Rc::new(ProfilePolicy::new(profile));
     let executor = Rc::new(EffectsExecutor { store: store.clone() });
+    let events: Rc<RefCell<Vec<DomainEvent>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = events.clone();
     let engine = Engine::new(EngineOptions {
         repo: store.clone(),
         policy: policy.clone(),
         assessor: Rc::new(InboxAssessor),
         executor,
         now: Rc::new(clock::now_iso),
-        emit: Some(Rc::new(
-            |event: DomainEvent| tracing::info!(event = %serde_json::to_string(&event).unwrap_or_default(), "domain event"),
-        )),
+        emit: Some(Rc::new(move |event: DomainEvent| {
+            tracing::info!(event = %serde_json::to_string(&event).unwrap_or_default(), "domain event");
+            sink.borrow_mut().push(event);
+        })),
     });
     let herdr = match Herdr::from_env() {
         Ok(h) => Some(h),
@@ -134,6 +171,7 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         }
     };
     let pane_id = std::env::var("HERDR_PANE_ID").ok().filter(|v| !v.is_empty());
+    let profile_mtime = std::fs::metadata(paths.profile_file()).and_then(|m| m.modified()).ok();
     let daemon = Daemon {
         paths,
         engine,
@@ -145,6 +183,12 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         started_at: clock::now_iso(),
         last_report: RefCell::new((String::new(), Instant::now() - REPORT_REFRESH)),
         handlers: HashMap::new(),
+        events,
+        state_repo: RefCell::new(state_repo),
+        dirty_tickets: RefCell::new(std::collections::BTreeSet::new()),
+        last_commit: Cell::new(Instant::now()),
+        last_renew: Cell::new(Instant::now()),
+        profile_mtime: Cell::new(profile_mtime),
     };
     daemon.write_info();
     match daemon.store.kv_get("daemon.version") {
@@ -313,7 +357,122 @@ impl Daemon {
             tracing::warn!(%e, "evaluate_due failed");
         }
         self.drain_effects();
+        self.watch_profile();
+        self.flush_records();
         self.register(false);
+    }
+
+    /// `profile set` from another process: reload and tell the engine.
+    fn watch_profile(&self) {
+        let mtime = std::fs::metadata(self.paths.profile_file()).and_then(|m| m.modified()).ok();
+        if mtime == self.profile_mtime.get() {
+            return;
+        }
+        self.profile_mtime.set(mtime);
+        if let Err(e) = self.reload_profile() {
+            tracing::warn!(%e, "profile reload failed");
+        }
+    }
+
+    fn reload_profile(&self) -> Result<Value, UserError> {
+        let before = self.policy.snapshot();
+        let after = Profile::load_or_init(&self.paths.profile_file()).map_err(UserError::internal)?;
+        let (from, to) = (before.version(), after.version());
+        if from == to {
+            return Ok(json!({ "changed": false, "version": to }));
+        }
+        // Tickets whose mode the new rules no longer allow are told so.
+        let mut effects = HashMap::new();
+        for ticket in self.store.ticket_open() {
+            if ticket.mandate.mode > after.modes.cap {
+                effects.insert(
+                    ticket.id.clone(),
+                    PolicyEffect {
+                        rules: Vec::new(),
+                        proactive_withdrawn: true,
+                    },
+                );
+            }
+        }
+        self.policy.replace(after.clone());
+        self.engine.policy_changed(&from, &to, &effects)?;
+        tracing::info!(%from, %to, tickets = effects.len(), "profile reloaded");
+        if self.state_repo.borrow().is_none() {
+            if let Ok(repo) = StateRepo::open_or_init(&after, &self.paths.profile_dir()) {
+                *self.state_repo.borrow_mut() = repo;
+            }
+        }
+        Ok(json!({ "changed": true, "from": from, "to": to, "tickets_told": effects.len() }))
+    }
+
+    /// Ticket records and events go to the state repo; commits are batched.
+    fn flush_records(&self) {
+        let events: Vec<DomainEvent> = std::mem::take(&mut *self.events.borrow_mut());
+        let repo = self.state_repo.borrow();
+        let Some(repo) = repo.as_ref() else { return };
+        for event in &events {
+            let ticket_id = match event {
+                DomainEvent::TicketCreated { ticket_id, .. }
+                | DomainEvent::TicketResumed { ticket_id, .. }
+                | DomainEvent::TicketEnded { ticket_id, .. }
+                | DomainEvent::AssignmentStarted { ticket_id, .. }
+                | DomainEvent::AssignmentEnded { ticket_id, .. }
+                | DomainEvent::CheckpointReached { ticket_id, .. }
+                | DomainEvent::CheckpointApproved { ticket_id, .. } => Some(ticket_id.clone()),
+                _ => None,
+            };
+            if let Some(id) = ticket_id {
+                if let Some(ticket) = self.store.ticket_get(&id) {
+                    if let Err(e) = repo.append_event(&ticket, event) {
+                        tracing::warn!(%e, "could not append event");
+                    }
+                }
+                self.dirty_tickets.borrow_mut().insert(id);
+            }
+        }
+        let dirty: Vec<String> = std::mem::take(&mut *self.dirty_tickets.borrow_mut()).into_iter().collect();
+        for id in dirty {
+            if let Some(ticket) = self.store.ticket_get(&id) {
+                if let Err(e) = repo.write_ticket(&ticket) {
+                    tracing::warn!(%e, ticket = %id, "could not write ticket record");
+                }
+            }
+        }
+        if self.last_commit.get().elapsed() >= COMMIT_INTERVAL {
+            self.last_commit.set(Instant::now());
+            // Reports and notes change tickets without a lifecycle event: refresh the open ones.
+            for ticket in self.store.ticket_open() {
+                let _ = repo.write_ticket(&ticket);
+            }
+            self.sync_repo(repo, "superagent: ticket records");
+        }
+        if self.last_renew.get().elapsed() >= Duration::from_secs(RENEW_SECONDS as u64) {
+            self.last_renew.set(Instant::now());
+            if let Err(e) = repo.renew() {
+                tracing::error!(%e, "lease renew failed: another machine may hold this profile");
+                if let Some(herdr) = &self.herdr {
+                    let _ = herdr.notify("superagent lease lost", Some(&e.to_string()));
+                }
+            }
+        }
+    }
+
+    fn sync_repo(&self, repo: &StateRepo, message: &str) -> Value {
+        let committed = match repo.commit(message) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(%e, "state repo commit failed");
+                return json!({ "committed": false, "error": e });
+            }
+        };
+        let pushed = match repo.push() {
+            Ok(result) => format!("{result:?}").to_lowercase(),
+            Err(e) => {
+                tracing::warn!(%e, "state repo push failed");
+                e
+            }
+        };
+        json!({ "committed": committed, "push": pushed })
     }
 
     /// Runs due effects of every kind that has a handler. Kinds without one
@@ -338,6 +497,18 @@ impl Daemon {
 
     fn finish(&self) -> Result<(), String> {
         let _ = std::fs::remove_file(self.paths.socket_path());
+        self.flush_records();
+        if let Some(repo) = self.state_repo.borrow().as_ref() {
+            for ticket in self.store.ticket_list() {
+                let _ = repo.write_ticket(&ticket);
+            }
+            self.sync_repo(repo, "superagent: stop");
+            if !self.flags.restart.get() {
+                if let Err(e) = repo.release() {
+                    tracing::warn!(%e, "lease release failed");
+                }
+            }
+        }
         if self.flags.restart.get() {
             tracing::info!("restarting into the binary on PATH");
             #[cfg(unix)]
@@ -411,7 +582,66 @@ impl Daemon {
             "note" => Ok(ticket_view(
                 &self.engine.note(str_param(params, "ticket")?, str_param(params, "text")?)?,
             )),
-            "profile" => Ok(serde_json::to_value(self.policy.snapshot())?),
+            "profile" => {
+                let mut value = serde_json::to_value(self.policy.snapshot())?;
+                value["profile_path"] = json!(self.paths.profile_file());
+                value["profile_dir"] = json!(self.paths.profile_dir());
+                Ok(value)
+            }
+            "profile_reload" => self.reload_profile(),
+            "requests" => {
+                // Each request with the mode proposed for it: its ticket's mandate when it started one.
+                let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+                let list = self.store.request_list();
+                let start = list.len().saturating_sub(limit);
+                let items: Vec<Value> = list[start..]
+                    .iter()
+                    .map(|request| {
+                        let proposed = self
+                            .store
+                            .disposition_get(&request.id)
+                            .and_then(|d| d.decision_id)
+                            .and_then(|id| self.store.decision_get(&id))
+                            .and_then(|d| d.mandate.map(|m| m.mode))
+                            .or(request.mode);
+                        json!({ "request": request, "proposed": proposed })
+                    })
+                    .collect();
+                Ok(Value::Array(items))
+            }
+            "session_set" => {
+                let pane = str_param(params, "pane_id")?;
+                self.store.kv_set("session.pane_id", pane);
+                self.store
+                    .kv_set("session.harness", params.get("harness").and_then(Value::as_str).unwrap_or(""));
+                if let Some(herdr) = &self.herdr {
+                    let title = format!("◆ SUPERAGENT · {}", self.paths.profile);
+                    let _ = herdr.report_pane_metadata(
+                        pane,
+                        Some(&title),
+                        &[("sa_role", "superagent"), ("sa_profile", &self.paths.profile)],
+                    );
+                }
+                Ok(json!({ "pane_id": pane }))
+            }
+            "sync" => match self.state_repo.borrow().as_ref() {
+                Some(repo) => {
+                    for ticket in self.store.ticket_list() {
+                        let _ = repo.write_ticket(&ticket);
+                    }
+                    self.last_commit.set(Instant::now());
+                    Ok(self.sync_repo(repo, params.get("message").and_then(Value::as_str).unwrap_or("superagent: sync")))
+                }
+                None => Ok(json!({ "committed": false, "push": "no state repo configured" })),
+            },
+            "lease" => Ok(match self.state_repo.borrow().as_ref() {
+                Some(repo) => serde_json::to_value(repo.lease())?,
+                None => Value::Null,
+            }),
+            "reindex" => match self.state_repo.borrow().as_ref() {
+                Some(repo) => Ok(json!({ "tickets": repo.reindex(self.store.as_ref()).map_err(UserError::internal)? })),
+                None => Err(UserError::internal("no state repo configured")),
+            },
             other => Err(UserError::internal(format!("unknown method '{other}'"))),
         }
     }
@@ -449,6 +679,10 @@ impl Daemon {
             "stages": stages,
             "candidates": self.store.eval_list().len(),
             "effects": effects,
+            "session_pane_id": self.store.kv_get("session.pane_id"),
+            "harness": self.store.kv_get("session.harness").filter(|h| !h.is_empty()).unwrap_or_else(|| self.policy.snapshot().superagent.harness),
+            "state_repo": self.policy.snapshot().state_repo.kind,
+            "lease": self.state_repo.borrow().as_ref().and_then(|r| r.lease()).map(|l| format!("{} until {}", l.machine, l.expires)),
         }))
     }
 

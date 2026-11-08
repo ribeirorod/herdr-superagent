@@ -6,8 +6,9 @@ and lets you review at checkpoints. Harness-agnostic (Claude Code, Codex and
 Pi first), model-agnostic, one profile per context (work, personal, …).
 
 The design is in [docs/PLAN.md](docs/PLAN.md). This repository is at
-**phase 0** (the skeleton); see [docs/phase-0.md](docs/phase-0.md) for what
-works today and what is next.
+**phase 1**: the engine, the daemon, profiles with calibration, and the
+per-profile state repo with its lease. See [docs/phase-0.md](docs/phase-0.md)
+and [docs/phase-1.md](docs/phase-1.md) for what works today and what is next.
 
 ## Install
 
@@ -21,12 +22,25 @@ with `cargo` when no release asset exists) and links it into `~/.local/bin`.
 `herdr-superagent` must be on `PATH`: workers call it, and herdr uses it to
 resume the daemon after a server restart.
 
-## What phase 0 gives you
+## What works today
 
-Inside herdr, `herdr-superagent ensure` (run by the plugin's startup hook)
-creates a `superagent · <profile>` workspace with the cockpit layout: the
-superagent session pane on the left, the daemon pane on the right. The daemon
-registers itself with herdr and keeps the profile's state in SQLite.
+Inside herdr, `herdr-superagent start --profile work` creates a
+`superagent · work` workspace with the cockpit layout (the superagent session
+on the left, the daemon on the right), starts the superagent in your harness
+(`--harness claude|codex|pi`, `--model …`) and briefs it. On a profile's first
+start the brief is the **calibration** interview: the superagent runs
+`herdr-superagent doctor`, asks how you work, and writes the profile through
+`herdr-superagent profile set`, which validates every change, shows a diff and
+keeps history for `profile undo`. Keys that affect how much review a request
+gets (`modes`, `repos`, `limits`, `routing`) can only be changed by you, with
+`--yes`, and every change replays your last 50 requests to show whose mode
+would change.
+
+With `state_repo.kind = "remote"`, the profile directory is a checkout of a
+private git repo: tickets are written as `ticket.md`, `ticket.json` and
+`events.jsonl`, committed in batches and pushed. One machine runs a profile at
+a time (a lease, renewed every five minutes); `start` on another machine pulls
+the records, takes the lease and rebuilds the local database.
 
 ```text
 herdr-superagent submit "Fix the flaky login test" --workflow software-dev --mode checkpoint

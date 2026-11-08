@@ -31,10 +31,16 @@ pub struct Cli {
 pub enum Command {
     /// Make sure the superagent workspace and daemon exist (idempotent; run by the plugin's startup hook).
     Ensure,
-    /// Open the superagent workspace, starting what is missing.
+    /// Open the cockpit and start the superagent session (calibration on first start).
     Start(StartArgs),
-    /// Stop the daemon of a profile.
+    /// Stop the daemon of a profile: finish the batch, push, release the lease.
     Stop,
+    /// Inventory for calibration: harnesses, their MCP servers, repos, herdr.
+    Doctor,
+    /// Commit and push the state repo now.
+    Sync,
+    /// Rebuild the local database from the state repo's ticket records.
+    Reindex,
     /// The daemon's status: tickets by stage, pending candidates and effects.
     Status,
     /// Run the daemon in the foreground (herdr runs this in the daemon pane).
@@ -81,8 +87,11 @@ pub enum Command {
     Note { ticket: String, text: String },
     /// Send a request to evaluation again.
     Reevaluate { request_id: String },
-    /// Show the profile.
-    Profile,
+    /// Show or change the profile: `profile`, `profile set key=value …`, `profile undo`.
+    Profile {
+        #[command(subcommand)]
+        action: Option<ProfileAction>,
+    },
     /// Dispatch a herdr plugin action (reads HERDR_PLUGIN_ACTION_ID).
     #[command(hide = true)]
     Action,
@@ -96,6 +105,27 @@ pub struct StartArgs {
     /// Model for the superagent session. Saved to the profile.
     #[arg(long)]
     pub model: Option<String>,
+    /// Break another machine's lease on this profile's state repo.
+    #[arg(long)]
+    pub take_over: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProfileAction {
+    /// Set keys: `superagent.model=opus repos[+].path=~/work/api modes.cap=checkpoint`.
+    Set {
+        assignments: Vec<String>,
+        /// Confirm a change to a protected key (modes, repos, limits, routing).
+        #[arg(long)]
+        yes: bool,
+        /// Show the diff and the mode replay without saving.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Revert the last `profile set`.
+    Undo,
+    /// Print the profile directory path.
+    Path,
 }
 
 #[derive(Args, Debug)]
@@ -180,25 +210,52 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             out(value, ensure_text(&report))
         }
         Command::Start(args) => {
-            if args.harness.is_some() || args.model.is_some() {
-                let mut saved = crate::profile::Profile::load_or_init(&paths.profile_file())?;
-                if let Some(h) = args.harness {
-                    saved.superagent.harness = h;
-                }
-                if let Some(m) = args.model {
-                    saved.superagent.model = m;
-                }
-                saved.save(&paths.profile_file())?;
-            }
-            let report = crate::ensure::ensure(&profile, true)?;
+            let report = crate::session::start(&profile, args.harness, args.model, args.take_over)?;
             let value = serde_json::to_value(&report).map_err(|e| e.to_string())?;
-            let mut text = ensure_text(&report);
-            text.push_str("\nThe superagent session (agent.start in the left pane) comes with phase 1.");
+            let mut text = ensure_text(&report.ensure);
+            text.push_str(&format!(
+                "\nsession: {} ({} {}){}{}",
+                report.session,
+                report.harness,
+                if report.model.is_empty() {
+                    "default model".to_string()
+                } else {
+                    report.model.clone()
+                },
+                report.prompt.as_ref().map(|p| format!(", briefed for {p}")).unwrap_or_default(),
+                report.session_pane_id.as_ref().map(|p| format!(", pane {p}")).unwrap_or_default()
+            ));
+            if let Some(lease) = &report.lease {
+                text.push_str(&format!("\nlease: {lease}"));
+            }
+            if let Some(n) = report.reindexed {
+                text.push_str(&format!("\nreindexed {n} tickets from the state repo"));
+            }
             out(value, text)
         }
         Command::Stop => {
-            let result = daemon("shutdown", json!({ "restart": false }))?;
-            out(result, format!("stopping the daemon of profile '{profile}'"))
+            let result = crate::session::stop(&profile)?;
+            out(
+                result,
+                format!("stopping the daemon of profile '{profile}' (batch committed, lease released)"),
+            )
+        }
+        Command::Doctor => {
+            let loaded = crate::profile::Profile::load_or_init(&paths.profile_file())?;
+            let report = crate::calibration::doctor(&loaded);
+            let value = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+            out(value, doctor_text(&report))
+        }
+        Command::Sync => {
+            let value = daemon("sync", json!({}))?;
+            out(
+                value.clone(),
+                format!("committed: {} · push: {}", value["committed"], value["push"].as_str().unwrap_or("")),
+            )
+        }
+        Command::Reindex => {
+            let value = daemon("reindex", json!({}))?;
+            out(value.clone(), format!("reindexed {} tickets", value["tickets"]))
         }
         Command::Status => {
             let status = daemon("status", json!({}))?;
@@ -323,13 +380,123 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             let value = daemon("reevaluate", json!({ "request_id": request_id }))?;
             out(value.clone(), format!("queued: {}", value["queued"]))
         }
-        Command::Profile => {
-            let value = daemon("profile", json!({})).or_else(|_| {
-                crate::profile::Profile::load_or_init(&paths.profile_file())
-                    .and_then(|p| serde_json::to_value(p).map_err(|e| e.to_string()))
-            })?;
-            let text = toml::to_string_pretty(&value).unwrap_or_default();
-            out(value, text)
+        Command::Profile { action: None } => {
+            let loaded = crate::profile::Profile::load_or_init(&paths.profile_file())?;
+            let mut value = serde_json::to_value(&loaded).map_err(|e| e.to_string())?;
+            value["profile_path"] = json!(paths.profile_file());
+            value["profile_dir"] = json!(paths.profile_dir());
+            value["version"] = json!(loaded.version());
+            out(
+                value,
+                format!(
+                    "# {} (version {})\n{}",
+                    paths.profile_file().display(),
+                    loaded.version(),
+                    loaded.to_toml()
+                ),
+            )
+        }
+        Command::Profile {
+            action: Some(ProfileAction::Path),
+        } => out(
+            json!({ "profile_dir": paths.profile_dir() }),
+            paths.profile_dir().display().to_string(),
+        ),
+        Command::Profile {
+            action: Some(ProfileAction::Undo),
+        } => {
+            let store = crate::profile::ProfileStore::new(paths.profile_file());
+            let before = store.read_text()?;
+            match store.undo()? {
+                Some(after) => {
+                    let _ = daemon("profile_reload", json!({}));
+                    let lines = crate::profile::diff(&before, &after);
+                    out(json!({ "undone": true, "diff": lines }), format!("undone:\n{}", lines.join("\n")))
+                }
+                None => out(json!({ "undone": false }), "nothing to undo".into()),
+            }
+        }
+        Command::Profile {
+            action: Some(ProfileAction::Set { assignments, yes, dry_run }),
+        } => {
+            if assignments.is_empty() {
+                return Err("profile set needs at least one key=value".into());
+            }
+            let parsed = assignments
+                .iter()
+                .map(|a| crate::profile::Assignment::parse(a))
+                .collect::<Result<Vec<_>, _>>()?;
+            let protected: Vec<String> = parsed.iter().filter(|a| a.protected()).map(|a| a.key.clone()).collect();
+            let store = crate::profile::ProfileStore::new(paths.profile_file());
+            let before_text = store.read_text()?;
+            let before = crate::profile::Profile::parse(&before_text)?;
+            let after = crate::profile::apply(&before_text, &parsed)?;
+            let lines = crate::profile::diff(&before_text, &after.to_toml());
+            // Replay recent requests against the new rules (PLAN §4).
+            let requests: Vec<(crate::core::model::Request, Option<crate::core::model::Mode>)> = daemon("requests", json!({ "limit": 50 }))
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .filter_map(|item| {
+                            let request = serde_json::from_value(item.get("request")?.clone()).ok()?;
+                            let proposed = item.get("proposed").and_then(|p| serde_json::from_value(p.clone()).ok());
+                            Some((request, proposed))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let changes = crate::profile::mode_changes(&before, &after, &requests);
+            let mut text = if lines.is_empty() {
+                "no change".to_string()
+            } else {
+                lines.join("\n")
+            };
+            if !changes.is_empty() {
+                text.push_str("\nmode changes for recent requests:");
+                for c in &changes {
+                    text.push_str(&format!("\n  {}  {} → {}  {}", c.request_id, c.before, c.after, c.text));
+                }
+            }
+            if !protected.is_empty() && !yes {
+                text.push_str(&format!(
+                    "\nrefused: {} {} protected (affects how much review a request gets). Run this from your own shell with --yes.",
+                    protected.join(", "),
+                    if protected.len() == 1 { "is" } else { "are" }
+                ));
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({ "saved": false, "protected": protected, "diff": lines, "mode_changes": changes })
+                        )
+                        .unwrap_or_default()
+                    );
+                } else {
+                    println!("{text}");
+                }
+                return Ok(3);
+            }
+            if dry_run || lines.is_empty() {
+                return out(
+                    json!({ "saved": false, "dry_run": dry_run, "diff": lines, "mode_changes": changes }),
+                    format!("{text}\n(not saved)"),
+                );
+            }
+            store.commit(&before_text, &after)?;
+            let reload = daemon("profile_reload", json!({})).ok();
+            text.push_str(&format!(
+                "\nsaved {} (version {} → {}){}",
+                paths.profile_file().display(),
+                before.version(),
+                after.version(),
+                if reload.is_some() { ", daemon reloaded" } else { "" }
+            ));
+            out(
+                json!({ "saved": true, "diff": lines, "mode_changes": changes, "from": before.version(), "to": after.version() }),
+                text,
+            )
         }
         Command::Action => action(&profile, &paths),
     }
@@ -376,6 +543,41 @@ fn action(profile: &str, paths: &Paths) -> Result<i32, String> {
         }
         other => Err(format!("unknown action '{other}'")),
     }
+}
+
+fn doctor_text(report: &crate::calibration::Doctor) -> String {
+    let mut lines = vec![format!(
+        "profile {} · {} · herdr: {}{} · herdr-superagent on PATH: {}",
+        report.profile,
+        if report.calibrated { "calibrated" } else { "NOT calibrated" },
+        if report.inside_herdr { "inside" } else { "not inside" },
+        report.herdr_version.as_ref().map(|v| format!(" {v}")).unwrap_or_default(),
+        if report.superagent_on_path { "yes" } else { "NO" }
+    )];
+    for h in &report.harnesses {
+        let mcp = match &h.mcp_servers {
+            Some(list) if list.is_empty() => "no MCP servers".to_string(),
+            Some(list) => format!("MCP: {}", list.join(", ")),
+            None => "MCP: unknown".to_string(),
+        };
+        lines.push(format!(
+            "  {:<7} {}{}{}",
+            h.name,
+            if h.installed { "installed" } else { "not installed" },
+            if h.installed { format!(" · {mcp}") } else { String::new() },
+            h.note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()
+        ));
+    }
+    for r in &report.repos {
+        lines.push(format!(
+            "  repo {:<32} {}{}",
+            r.path,
+            if r.exists { "exists" } else { "MISSING" },
+            r.branch.as_ref().map(|b| format!(" · {b}")).unwrap_or_default()
+        ));
+    }
+    lines.push(format!("  state repo: {}", report.state_repo));
+    lines.join("\n")
 }
 
 fn first_line(text: &str) -> String {
@@ -425,6 +627,13 @@ fn status_text(status: &Value) -> String {
         if !parts.is_empty() {
             lines.push(format!("stages: {}", parts.join(", ")));
         }
+    }
+    if let Some(lease) = status["lease"].as_str() {
+        lines.push(format!(
+            "state repo {} · lease {}",
+            status["state_repo"].as_str().unwrap_or(""),
+            lease
+        ));
     }
     if let Some(effects) = status["effects"].as_array().filter(|e| !e.is_empty()) {
         let parts: Vec<String> = effects

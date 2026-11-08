@@ -1,6 +1,7 @@
 //! herdr-superagent: a herdr plugin with one superagent session that routes
 //! your requests into tickets, runs workers in herdr panes and lets you review.
 
+mod calibration;
 mod cli;
 // The executor-facing engine API (assignment lifecycle, delivery, status requests)
 // is exercised by the tests now and wired to herdr panes in phase 2.
@@ -14,6 +15,8 @@ mod herdr;
 mod ipc;
 mod paths;
 mod profile;
+mod session;
+mod staterepo;
 mod store;
 
 use clap::Parser;
