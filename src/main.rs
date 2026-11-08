@@ -9,6 +9,7 @@ mod cli;
 mod core;
 mod daemon;
 mod ensure;
+mod envpath;
 // Pane and workspace fields that phase 2's observer reads.
 #[allow(dead_code)]
 mod herdr;

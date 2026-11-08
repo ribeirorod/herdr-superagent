@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::daemon::{on_path, VERSION};
+use crate::daemon::VERSION;
 use crate::herdr::{Herdr, HerdrError};
 use crate::ipc;
 use crate::paths::Paths;
@@ -45,7 +45,8 @@ pub fn workspace_label(profile: &str) -> String {
 /// The argv that runs the daemon: the binary on PATH when available (so herdr
 /// can resume it), else this executable's absolute path.
 pub fn daemon_command(profile: &str) -> Vec<String> {
-    let program = if on_path("herdr-superagent") {
+    // On the login shell's PATH, which the pane receives; herdr's resume command needs a plain name.
+    let program = if crate::envpath::locate("herdr-superagent").is_some() {
         "herdr-superagent".to_string()
     } else {
         std::env::current_exe()
@@ -61,8 +62,8 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
     Profile::load_or_init(&paths.profile_file())?;
     let herdr = Herdr::from_env().map_err(|e| e.to_string())?;
     let mut warnings = Vec::new();
-    if !on_path("herdr-superagent") {
-        warnings.push("herdr-superagent is not on PATH: herdr cannot resume the daemon after a restart, and workers cannot call it. Link it into ~/.local/bin.".to_string());
+    if crate::envpath::locate("herdr-superagent").is_none() {
+        warnings.push("herdr-superagent is not on your shell's PATH: herdr cannot resume the daemon after a restart, and workers cannot call it. Put the binary on PATH.".to_string());
     }
     let mut report = EnsureReport {
         profile: profile_name.to_string(),
@@ -97,7 +98,8 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let debug_flag = if crate::logging::debug_enabled(false) { "1" } else { "" };
     // The shell that runs `start` has the full PATH; herdr panes often get a non-login one.
-    let path_env = std::env::var("PATH").unwrap_or_default();
+    // herdr panes often get a non-login PATH: give them the login shell's, merged with ours.
+    let path_env = crate::envpath::full_path();
     let env = [
         ("SUPERAGENT_PROFILE", profile_name),
         ("HERDR_SUPERAGENT_DEBUG", debug_flag),
@@ -173,7 +175,7 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
 /// the right. Phase 6 replaces the daemon pane's output with the dashboard.
 fn cockpit_layout(profile: &str, home: &str, state_dir: &str, daemon_command: &[String]) -> Value {
     let debug = if crate::logging::debug_enabled(false) { "1" } else { "" };
-    let path_env = std::env::var("PATH").unwrap_or_default();
+    let path_env = crate::envpath::full_path();
     let env =
         |role: &str| json!({ "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": role, "HERDR_SUPERAGENT_DEBUG": debug, "PATH": path_env });
     json!({
