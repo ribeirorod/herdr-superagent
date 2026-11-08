@@ -114,7 +114,8 @@ pub fn run(profile_name: &str) -> Result<(), String> {
     paths.ensure_dirs().map_err(|e| format!("create profile directories: {e}"))?;
     let profile = Profile::load_or_init(&paths.profile_file())?;
 
-    // One daemon per profile: a live socket is the lock.
+    // One daemon per profile: a live socket is the lock (a failed ping here is the expected answer).
+    tracing::debug!(target: "daemon", "lock check: pinging an earlier daemon on this profile's socket");
     if let Ok(ping) = crate::ipc::ping(&paths.socket_path()) {
         return Err(format!(
             "a daemon for profile '{profile_name}' already runs (pid {}, version {})",

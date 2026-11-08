@@ -119,9 +119,7 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
         "You are the superagent for herdr profile '{profile_name}'. Read {} and follow it. Start by running `herdr-superagent status`.",
         brief_path.display()
     );
-    herdr
-        .call("agent.prompt", json!({ "target": pane.pane_id, "text": prompt }))
-        .map_err(|e| format!("agent.prompt: {e}"))?;
+    prompt_when_ready(&herdr, &pane.pane_id, &prompt)?;
     Ok(StartReport {
         ensure: report,
         harness,
@@ -132,6 +130,33 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
         lease,
         reindexed,
     })
+}
+
+/// `agent.start` can return with `launch_pending` before the harness is ready
+/// and `agent.prompt` then answers `agent_not_ready`: wait for an idle agent,
+/// then prompt, retrying a few times.
+fn prompt_when_ready(herdr: &Herdr, pane_id: &str, prompt: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let _ = herdr.call(
+        "agent.wait",
+        json!({ "target": pane_id, "until": ["idle", "done"], "timeout_ms": 90000 }),
+    );
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match herdr.call("agent.prompt", json!({ "target": pane_id, "text": prompt })) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last = e.to_string();
+                if !(last.contains("agent_not_ready") || last.contains("not an active") || last.contains("agent_blocked")) {
+                    return Err(format!("agent.prompt: {last}"));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    Err(format!(
+        "agent.prompt: the superagent session did not become ready in time ({last}); paste the prompt into pane {pane_id} by hand"
+    ))
 }
 
 /// `stop`: the daemon finishes its batch, releases the lease and exits; the
