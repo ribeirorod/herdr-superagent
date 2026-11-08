@@ -108,7 +108,7 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                 .call(
                     "layout.apply",
                     json!({
-                        "workspace_id": workspace_id,
+                        // herdr refuses tab_id together with workspace_id; the tab names the workspace.
                         "tab_id": tab_id,
                         "tab_label": "cockpit",
                         "focus": focus,
