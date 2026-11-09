@@ -92,8 +92,14 @@ impl Herdr {
 
     /// Sends one request and returns its `result`, or the API error.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
+        self.call_with_timeout(method, params, self.timeout)
+    }
+
+    /// `call` for long polls (`agent.wait`): the read timeout must outlast the
+    /// server-side `timeout_ms`, or the client gives up first.
+    pub fn call_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, HerdrError> {
         let started = std::time::Instant::now();
-        let result = self.call_inner(method, &params);
+        let result = self.call_inner(method, &params, timeout);
         let ms = started.elapsed().as_millis();
         match &result {
             Ok(value) => {
@@ -104,12 +110,12 @@ impl Herdr {
         result
     }
 
-    fn call_inner(&self, method: &str, params: &Value) -> Result<Value, HerdrError> {
+    fn call_inner(&self, method: &str, params: &Value, timeout: Duration) -> Result<Value, HerdrError> {
         #[cfg(unix)]
         {
             use std::os::unix::net::UnixStream;
             let mut stream = UnixStream::connect(&self.socket)?;
-            stream.set_read_timeout(Some(self.timeout))?;
+            stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(self.timeout))?;
             let id = format!("sa_{}", std::process::id());
             let request = json!({ "id": id, "method": method, "params": params });
@@ -133,7 +139,7 @@ impl Herdr {
         }
         #[cfg(not(unix))]
         {
-            let _ = (method, params);
+            let _ = (method, params, timeout);
             Err(HerdrError::Protocol("named pipes are not supported yet; use HERDR_BIN_PATH".into()))
         }
     }

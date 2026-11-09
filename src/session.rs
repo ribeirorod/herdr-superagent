@@ -20,7 +20,7 @@ pub struct StartReport {
     pub harness: String,
     pub model: String,
     pub session_pane_id: Option<String>,
-    /// `started`, `already_running` or `no_pane`.
+    /// `started`, `blocked` (the prompt was not delivered), `already_running` or `no_pane`.
     pub session: String,
     /// `calibration` or `brief`: which prompt the session received.
     pub prompt: Option<String>,
@@ -97,15 +97,10 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
     }
 
     let args = calibration::model_args(&harness, &model);
-    // herdr agent names are unique across the session: one per profile.
-    let slug: String = profile_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
     herdr
         .call(
             "agent.start",
-            json!({ "name": format!("superagent-{slug}"), "kind": harness, "pane_id": pane.pane_id, "args": args, "timeout_ms": 60000 }),
+            json!({ "name": agent_name(profile_name), "kind": harness, "pane_id": pane.pane_id, "args": args, "timeout_ms": 60000 }),
         )
         .map_err(|e| format!("agent.start {harness} in {}: {e}", pane.pane_id))?;
 
@@ -124,43 +119,73 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
         "You are the superagent for herdr profile '{profile_name}'. Read {} and follow it. Start by running `herdr-superagent status`.",
         brief_path.display()
     );
-    prompt_when_ready(&herdr, &pane.pane_id, &prompt)?;
+    // The workspace and daemon are up either way: a session that never took the
+    // prompt is reported, not an error.
+    let session = match prompt_when_ready(&herdr, &pane.pane_id, &prompt) {
+        Ok(()) => "started",
+        Err(e) => {
+            tracing::warn!("{e}");
+            "blocked"
+        }
+    };
     Ok(StartReport {
         ensure: report,
         harness,
         model,
         session_pane_id: Some(pane.pane_id),
-        session: "started".into(),
+        session: session.into(),
         prompt: Some(kind.into()),
         lease,
         reindexed,
     })
 }
 
-/// `agent.start` can return with `launch_pending` before the harness is ready
-/// and `agent.prompt` then answers `agent_not_ready`: wait for an idle agent,
-/// then prompt, retrying a few times.
+/// The herdr agent name of a profile's session. herdr names are unique among
+/// live agents and must match `[a-z][a-z0-9_-]{0,31}`.
+fn agent_name(profile: &str) -> String {
+    format!("superagent-{}", profile.to_ascii_lowercase()).chars().take(32).collect()
+}
+
+/// Waits for the session, then prompts it. `agent.start` can return before the
+/// harness is ready (`agent_not_ready`), and the harness can stop at a dialog
+/// only the person can answer (`agent_blocked`: folder trust, login,
+/// permissions): then herdr notifies them and we wait up to ten minutes.
 fn prompt_when_ready(herdr: &Herdr, pane_id: &str, prompt: &str) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let _ = herdr.call(
-        "agent.wait",
-        json!({ "target": pane_id, "until": ["idle", "done"], "timeout_ms": 90000 }),
-    );
+    let wait = |ms: u64| {
+        let _ = herdr.call_with_timeout(
+            "agent.wait",
+            json!({ "target": pane_id, "until": ["idle", "done"], "timeout_ms": ms }),
+            Duration::from_millis(ms + 5000),
+        );
+    };
+    wait(90_000);
+    let mut deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut notified = false;
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
         match herdr.call("agent.prompt", json!({ "target": pane_id, "text": prompt })) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 last = e.to_string();
+                if last.contains("agent_blocked") && !notified {
+                    notified = true;
+                    let _ = herdr.notify(
+                        "superagent session needs you",
+                        Some(&format!("Answer the prompt in pane {pane_id}; the brief follows.")),
+                    );
+                    wait(600_000);
+                    deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    continue;
+                }
                 if !(last.contains("agent_not_ready") || last.contains("not an active") || last.contains("agent_blocked")) {
-                    return Err(format!("agent.prompt: {last}"));
+                    return Err(format!("agent.prompt: {last}; paste this into pane {pane_id}: {prompt}"));
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(1500));
     }
     Err(format!(
-        "agent.prompt: the superagent session did not become ready in time ({last}); paste the prompt into pane {pane_id} by hand"
+        "the superagent session did not become ready ({last}); paste this into pane {pane_id}: {prompt}"
     ))
 }
 
@@ -175,4 +200,14 @@ pub fn stop(profile_name: &str) -> Result<Value, String> {
         Duration::from_secs(10),
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_names_fit_herdr() {
+        assert_eq!(super::agent_name("work"), "superagent-work");
+        assert_eq!(super::agent_name("My_Work"), "superagent-my_work");
+        assert_eq!(super::agent_name(&"x".repeat(40)).len(), 32);
+    }
 }
