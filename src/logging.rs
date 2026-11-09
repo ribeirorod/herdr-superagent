@@ -26,13 +26,8 @@ pub fn log_file(paths: &crate::paths::Paths, process: &str) -> PathBuf {
 /// Installs the subscriber. Returns the log file path when one could be opened.
 pub fn init(paths: &crate::paths::Paths, process: &str, debug_mode: bool) -> Option<PathBuf> {
     // The shell sees warnings only; the daemon pane sees info; the file sees everything the mode allows.
-    let level = if debug_mode {
-        "debug"
-    } else if process == "daemon" {
-        "info"
-    } else {
-        "warn"
-    };
+    // Debug mode raises the file only: on stderr it buries the shell (`HERDR_SUPERAGENT_LOG` still can).
+    let level = if process == "daemon" { "info" } else { "warn" };
     let stderr_filter = EnvFilter::try_from_env("HERDR_SUPERAGENT_LOG").unwrap_or_else(|_| EnvFilter::new(level));
     let stderr_layer = fmt::layer()
         .with_target(false)
