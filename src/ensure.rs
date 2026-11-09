@@ -122,7 +122,7 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                         "tab_id": tab_id,
                         "tab_label": "cockpit",
                         "focus": focus,
-                        "root": cockpit_layout(profile_name, &home, paths.state_dir().display().to_string().as_str(), &command),
+                        "root": cockpit_layout(profile_name, &paths.profile_dir().display().to_string(), paths.state_dir().display().to_string().as_str(), &command),
                     }),
                 )
                 .map_err(|e| e.to_string())?;
@@ -141,7 +141,14 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                 .find(|p| p.workspace_id == workspace.workspace_id && p.label.as_deref() == Some("daemon"));
             match daemon_pane {
                 Some(pane) => {
-                    herdr.pane_run(&pane.pane_id, &shell_words(&command)).map_err(|e| e.to_string())?;
+                    // The pane's shell keeps the env it was created with: pass today's overrides.
+                    let overrides: Vec<String> = forwarded_env().into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    let line = if overrides.is_empty() {
+                        shell_words(&command)
+                    } else {
+                        shell_words(&[vec!["env".to_string()], overrides, command.clone()].concat())
+                    };
+                    herdr.pane_run(&pane.pane_id, &line).map_err(|e| e.to_string())?;
                     report.daemon_pane_id = Some(pane.pane_id.clone());
                 }
                 None => {
@@ -149,7 +156,12 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                         .layout_apply(
                             &workspace.workspace_id,
                             "cockpit",
-                            cockpit_layout(profile_name, &home, paths.state_dir().display().to_string().as_str(), &command),
+                            cockpit_layout(
+                                profile_name,
+                                &paths.profile_dir().display().to_string(),
+                                paths.state_dir().display().to_string().as_str(),
+                                &command,
+                            ),
                             focus,
                         )
                         .map_err(|e| e.to_string())?;
@@ -177,15 +189,23 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
 /// without the state and config roots the daemon would open another profile
 /// directory and listen on another socket.
 fn forwarded_env() -> Vec<(&'static str, String)> {
-    ["HERDR_SUPERAGENT_STATE_DIR", "HERDR_SUPERAGENT_CONFIG_DIR", "HERDR_SUPERAGENT_LOG"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()).map(|v| (key, v)))
-        .collect()
+    [
+        "HERDR_SUPERAGENT_STATE_DIR",
+        "HERDR_SUPERAGENT_CONFIG_DIR",
+        "HERDR_SUPERAGENT_LOG",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()).map(|v| (key, v)))
+    .collect()
 }
 
 /// The cockpit (PLAN §8b): the superagent session on the left, the daemon on
 /// the right. Phase 6 replaces the daemon pane's output with the dashboard.
-fn cockpit_layout(profile: &str, home: &str, state_dir: &str, daemon_command: &[String]) -> Value {
+/// The session runs in the profile directory, so a harness's folder trust
+/// covers that directory rather than all of `$HOME`.
+fn cockpit_layout(profile: &str, session_dir: &str, state_dir: &str, daemon_command: &[String]) -> Value {
     let debug = if crate::logging::debug_enabled(false) { "1" } else { "" };
     let path_env = crate::envpath::full_path();
     let env = |role: &str| {
@@ -199,7 +219,7 @@ fn cockpit_layout(profile: &str, home: &str, state_dir: &str, daemon_command: &[
         "type": "split",
         "direction": "right",
         "ratio": 0.65,
-        "first": { "type": "pane", "label": "superagent", "cwd": home, "env": env("superagent") },
+        "first": { "type": "pane", "label": "superagent", "cwd": session_dir, "env": env("superagent") },
         "second": { "type": "pane", "label": "daemon", "cwd": state_dir, "command": daemon_command, "env": env("daemon") }
     })
 }
