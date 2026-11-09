@@ -44,6 +44,16 @@ pub enum Command {
     Sync,
     /// Rebuild the local database from the state repo's ticket records.
     Reindex,
+    /// Per-project memory: `memory add --title … --summary-file …`, `memory search "…"`, `memory show <id>`.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+    /// The read-only task list (the cockpit's right pane). `--once` prints one frame.
+    Dashboard {
+        #[arg(long)]
+        once: bool,
+    },
     /// Show the log files: `logs`, `logs --process daemon --lines 200`, `logs --follow`.
     Logs {
         /// daemon, cli, ensure or all.
@@ -128,6 +138,39 @@ pub struct StartArgs {
     /// Break another machine's lease on this profile's state repo.
     #[arg(long)]
     pub take_over: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MemoryAction {
+    /// Record a session summary (for the current ticket) or a note (with --project).
+    Add {
+        #[arg(long)]
+        title: String,
+        /// A markdown file with the summary.
+        #[arg(long, conflicts_with = "text")]
+        summary_file: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long, env = "SUPERAGENT_TICKET")]
+        ticket: Option<String>,
+        /// A project key (org/repo) or a repository path; defaults to the ticket's project.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, env = "SUPERAGENT_ROLE", default_value = "worker")]
+        role: String,
+    },
+    /// Search this project's memory (the ticket's project unless --project is given).
+    Search {
+        query: String,
+        #[arg(long, env = "SUPERAGENT_TICKET")]
+        ticket: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: u64,
+    },
+    /// Print one memory entry in full.
+    Show { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -276,6 +319,82 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         Command::Reindex => {
             let value = daemon("reindex", json!({}))?;
             out(value.clone(), format!("reindexed {} tickets", value["tickets"]))
+        }
+        Command::Dashboard { once } => {
+            crate::dashboard::run(&profile, once)?;
+            Ok(0)
+        }
+        Command::Memory {
+            action:
+                MemoryAction::Add {
+                    title,
+                    summary_file,
+                    text,
+                    ticket,
+                    project,
+                    role,
+                },
+        } => {
+            let body = match (summary_file, text) {
+                (Some(file), _) => std::fs::read_to_string(&file).map_err(|e| format!("read {file}: {e}"))?,
+                (None, Some(text)) => text,
+                (None, None) => return Err("memory add needs --summary-file or --text".into()),
+            };
+            let value = daemon(
+                "memory_add",
+                json!({ "title": title, "body": body, "ticket": ticket, "project": project, "role": role }),
+            )?;
+            out(
+                value.clone(),
+                format!(
+                    "remembered {} in project {}{}",
+                    value["id"].as_str().unwrap_or(""),
+                    value["project"].as_str().unwrap_or(""),
+                    value["file"].as_str().map(|f| format!(" ({f})")).unwrap_or_default()
+                ),
+            )
+        }
+        Command::Memory {
+            action:
+                MemoryAction::Search {
+                    query,
+                    ticket,
+                    project,
+                    limit,
+                },
+        } => {
+            let value = daemon(
+                "memory_search",
+                json!({ "query": query, "ticket": ticket, "project": project, "limit": limit }),
+            )?;
+            let hits = value["hits"].as_array().cloned().unwrap_or_default();
+            let mut text = format!("project {} · {} hits", value["project"].as_str().unwrap_or(""), hits.len());
+            for h in &hits {
+                text.push_str(&format!(
+                    "\n{}  {}  {}\n    {}",
+                    h["id"].as_str().unwrap_or("").chars().take(8).collect::<String>(),
+                    h["created_at"].as_str().unwrap_or("").chars().take(10).collect::<String>(),
+                    h["title"].as_str().unwrap_or(""),
+                    h["snippet"].as_str().unwrap_or("").replace('\n', " ")
+                ));
+            }
+            out(value, text)
+        }
+        Command::Memory {
+            action: MemoryAction::Show { id },
+        } => {
+            let value = daemon("memory_get", json!({ "id": id }))?;
+            if value.is_null() {
+                return Err(format!("no memory entry {id}"));
+            }
+            out(
+                value.clone(),
+                format!(
+                    "# {}\n{}",
+                    value["title"].as_str().unwrap_or(""),
+                    value["body"].as_str().unwrap_or("")
+                ),
+            )
         }
         Command::Logs { process, lines, follow } => {
             let files: Vec<std::path::PathBuf> = if process == "all" {
@@ -813,7 +932,7 @@ fn status_text(status: &Value) -> String {
             .iter()
             .map(|e| format!("{} {}", e["kind"].as_str().unwrap_or(""), e["pending"]))
             .collect();
-        lines.push(format!("effects waiting for an executor (phase 2): {}", parts.join(", ")));
+        lines.push(format!("effects queued: {}", parts.join(", ")));
     }
     lines.join("\n")
 }

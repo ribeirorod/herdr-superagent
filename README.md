@@ -6,9 +6,9 @@ and lets you review at checkpoints. Harness-agnostic (Claude Code, Codex and
 Pi first), model-agnostic, one profile per context (work, personal, …).
 
 The design is in [docs/PLAN.md](docs/PLAN.md). This repository is at
-**phase 1**: the engine, the daemon, profiles with calibration, and the
-per-profile state repo with its lease. See [docs/phase-0.md](docs/phase-0.md)
-and [docs/phase-1.md](docs/phase-1.md) for what works today and what is next.
+**phase 2**: the engine, the daemon, profiles with calibration, the state
+repo with its lease, and the executor that runs workers in herdr panes. See
+`docs/phase-*.md` for what works today and what is next.
 
 ## Install
 
@@ -56,9 +56,12 @@ herdr-superagent approve t-b395b8 --comment "go"
 herdr-superagent status
 ```
 
-Workers are **not launched yet**: the engine records every launch, delivery
-and stop as a durable effect, and phase 2 runs them in herdr panes. Until then
-`status` lists the effects waiting for an executor.
+Accepted tickets become **workers**: a worktree (branch `sa/<ticket>`) or a
+workspace, the tier's harness started with the mode's flags, a brief that
+carries the request, the mode rules and the project's memory. Workers report
+with `herdr-superagent report`, stop at `checkpoint`s, and end with a session
+summary (`memory add`) that later tickets of the same project find with
+`memory search`. The cockpit's right pane is a live task list.
 
 ## Testing a checkout in your herdr
 

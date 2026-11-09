@@ -336,6 +336,64 @@ impl StateRepo {
         Ok(dir)
     }
 
+    /// Writes a session summary beside the ticket: `summaries/NN-<role>.md` with frontmatter.
+    pub fn write_summary(&self, ticket: &Ticket, entry: &crate::memory::MemoryEntry) -> Result<PathBuf, String> {
+        let dir = self.ticket_dir(ticket).join("summaries");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) + 1;
+        let role: String = entry.role.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        let path = dir.join(format!("{n:02}-{}.md", if role.is_empty() { "worker" } else { &role }));
+        let text = format!(
+            "---\nid: {}\nproject: {}\nticket: {}\nassignment: {}\nrole: {}\ntitle: {}\ncreated: {}\n---\n\n{}\n",
+            entry.id,
+            entry.project,
+            ticket.id,
+            entry.assignment_id.as_deref().unwrap_or(""),
+            entry.role,
+            entry.title,
+            entry.created_at,
+            entry.body.trim_end()
+        );
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Writes a note outside any ticket: `memory/<project>/notes/<id>.md`.
+    pub fn write_note(&self, entry: &crate::memory::MemoryEntry) -> Result<PathBuf, String> {
+        let project: String = entry.project.chars().map(|c| if c == '/' { '_' } else { c }).collect();
+        let dir = self.dir.join("memory").join(project).join("notes");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.md", entry.id));
+        let text = format!(
+            "---\nid: {}\nproject: {}\nticket: \nassignment: \nrole: {}\ntitle: {}\ncreated: {}\n---\n\n{}\n",
+            entry.id,
+            entry.project,
+            entry.role,
+            entry.title,
+            entry.created_at,
+            entry.body.trim_end()
+        );
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Loads every summary and note file into the memory index; returns how many.
+    pub fn reindex_memory(&self, store: &crate::store::sqlite::SqliteStore) -> usize {
+        let mut count = 0;
+        let mut files = Vec::new();
+        collect_md(&self.dir.join("tickets"), &mut files);
+        collect_md(&self.dir.join("memory"), &mut files);
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if let Some(entry) = parse_summary(&text) {
+                if store.memory_add(&entry).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Appends an event to the ticket's `events.jsonl`.
     pub fn append_event(&self, ticket: &Ticket, event: &DomainEvent) -> Result<(), String> {
         use std::io::Write;
@@ -387,6 +445,40 @@ impl StateRepo {
         }
         ids
     }
+}
+
+fn collect_md(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_md(&path, out);
+        } else if path.extension().map(|e| e == "md").unwrap_or(false) && path.file_name().map(|n| n != "ticket.md").unwrap_or(false) {
+            out.push(path);
+        }
+    }
+}
+
+/// Parses a summary or note file written by `write_summary`/`write_note`.
+fn parse_summary(text: &str) -> Option<crate::memory::MemoryEntry> {
+    let rest = text.strip_prefix("---\n")?;
+    let (front, body) = rest.split_once("\n---\n")?;
+    let field = |name: &str| {
+        front
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}: ")).map(|v| v.trim().to_string()))
+    };
+    let opt = |name: &str| field(name).filter(|v| !v.is_empty());
+    Some(crate::memory::MemoryEntry {
+        id: field("id")?,
+        project: field("project")?,
+        ticket_id: opt("ticket"),
+        assignment_id: opt("assignment"),
+        role: field("role").unwrap_or_default(),
+        title: field("title")?,
+        body: body.trim().to_string(),
+        created_at: field("created")?,
+    })
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -464,6 +556,31 @@ mod tests {
         assert_eq!(repo.ticket_ids().into_iter().collect::<Vec<_>>(), vec!["t-abc123".to_string()]);
         let md = std::fs::read_to_string(written.join("ticket.md")).unwrap();
         assert!(md.contains("stage: working/queued") && md.contains("# Fix the flaky login test"));
+        let entry = crate::memory::now_entry(
+            "acme/api",
+            Some("t-abc123".into()),
+            Some("a1".into()),
+            "worker",
+            "t-abc123 worker: fix login",
+            "Goal: fix.\nWhat was done: locked the cache.",
+        );
+        let summary = repo.write_summary(&ticket("t-abc123"), &entry).unwrap();
+        assert!(summary.ends_with("summaries/01-worker.md"));
+        repo.write_note(&crate::memory::now_entry(
+            "acme/api",
+            None,
+            None,
+            "you",
+            "api conventions",
+            "PRs need two approvals.",
+        ))
+        .unwrap();
+        let sqlite = crate::store::sqlite::SqliteStore::open_in_memory().unwrap();
+        assert_eq!(repo.reindex_memory(&sqlite), 2);
+        assert_eq!(
+            sqlite.memory_search("acme/api", "cache", 5).unwrap()[0].ticket_id.as_deref(),
+            Some("t-abc123")
+        );
     }
 
     #[test]

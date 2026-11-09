@@ -29,6 +29,30 @@ pub struct Profile {
     pub routing: Routing,
     pub memory: Memory,
     pub state_repo: StateRepo,
+    pub harness_flags: HarnessFlags,
+}
+
+/// Flags that turn a harness's own permission prompts off, per mode (PLAN §6).
+/// Only `autonomous` has defaults; the other modes keep the prompts on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HarnessFlags {
+    pub autonomous: std::collections::BTreeMap<String, Vec<String>>,
+    pub checkpoint: std::collections::BTreeMap<String, Vec<String>>,
+    pub propose: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl Default for HarnessFlags {
+    fn default() -> Self {
+        let mut autonomous = std::collections::BTreeMap::new();
+        autonomous.insert("claude".to_string(), vec!["--dangerously-skip-permissions".to_string()]);
+        autonomous.insert("codex".to_string(), vec!["--full-auto".to_string()]);
+        HarnessFlags {
+            autonomous,
+            checkpoint: Default::default(),
+            propose: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

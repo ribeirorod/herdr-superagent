@@ -86,6 +86,9 @@ impl SqliteStore {
              CREATE INDEX IF NOT EXISTS decision_at ON decision(at);
              CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);",
         )?;
+        drop(conn);
+        self.memory_migrate()?;
+        let conn = self.conn.borrow();
         let version: Option<i64> = conn
             .query_row("SELECT value FROM kv WHERE key = 'schema'", [], |row| row.get::<_, String>(0))
             .optional()?
@@ -125,6 +128,23 @@ impl SqliteStore {
 
     fn json<T: Serialize>(value: &T) -> String {
         serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+    }
+
+    /// Runs a statement batch (used by other modules' migrations).
+    pub fn execute_batch(&self, sql: &str) -> Result<(), UserError> {
+        self.conn.borrow().execute_batch(sql)?;
+        Ok(())
+    }
+
+    /// Runs `work` with the connection (used by other modules' queries).
+    pub fn with_conn<T>(&self, work: impl FnOnce(&Connection) -> Result<T, UserError>) -> Result<T, UserError> {
+        let conn = self.conn.borrow();
+        work(&conn)
+    }
+
+    /// Reschedules an effect without counting a failed attempt (the executor is not ready for it yet).
+    pub fn effect_defer(&self, kind: &str, key: &str, due_ms: i64) {
+        self.exec("UPDATE effect SET due = ?3 WHERE kind = ?1 AND key = ?2", &[&kind, &key, &due_ms]);
     }
 
     fn exec(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) {

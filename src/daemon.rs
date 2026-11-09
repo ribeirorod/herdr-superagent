@@ -79,33 +79,35 @@ impl Assessor for InboxAssessor {
 }
 
 #[derive(Default)]
-struct Flags {
+pub(crate) struct Flags {
     shutdown: Cell<bool>,
     restart: Cell<bool>,
 }
 
-struct Daemon {
-    paths: Paths,
-    engine: Engine,
-    store: Rc<SqliteStore>,
-    policy: Rc<ProfilePolicy>,
-    herdr: Option<Herdr>,
-    pane_id: Option<String>,
-    flags: Flags,
-    started_at: String,
-    last_report: RefCell<(String, Instant)>,
-    handlers: HashMap<&'static str, EffectHandler>,
+pub(crate) struct Daemon {
+    pub(crate) paths: Paths,
+    pub(crate) engine: Engine,
+    pub(crate) store: Rc<SqliteStore>,
+    pub(crate) policy: Rc<ProfilePolicy>,
+    pub(crate) herdr: Option<Herdr>,
+    pub(crate) pane_id: Option<String>,
+    pub(crate) flags: Flags,
+    pub(crate) started_at: String,
+    pub(crate) last_report: RefCell<(String, Instant)>,
+    pub(crate) handlers: HashMap<&'static str, EffectHandler>,
     /// Domain events since the last tick, for the ticket records.
-    events: Rc<RefCell<Vec<DomainEvent>>>,
-    state_repo: RefCell<Option<StateRepo>>,
-    dirty_tickets: RefCell<std::collections::BTreeSet<String>>,
-    last_commit: Cell<Instant>,
-    last_renew: Cell<Instant>,
-    profile_mtime: Cell<Option<std::time::SystemTime>>,
+    pub(crate) events: Rc<RefCell<Vec<DomainEvent>>>,
+    pub(crate) state_repo: RefCell<Option<StateRepo>>,
+    pub(crate) dirty_tickets: RefCell<std::collections::BTreeSet<String>>,
+    pub(crate) last_commit: Cell<Instant>,
+    pub(crate) last_renew: Cell<Instant>,
+    pub(crate) profile_mtime: Cell<Option<std::time::SystemTime>>,
+    /// What the observer last saw of each worker pane.
+    pub(crate) workers: RefCell<HashMap<String, crate::executor::WorkerSeen>>,
 }
 
-/// Runs one due effect; `Err` schedules a retry with backoff.
-type EffectHandler = Box<dyn Fn(&Daemon, &Effect) -> Result<(), String>>;
+/// Runs one due effect: done, deferred (not ready yet), or failed (retry with backoff).
+type EffectHandler = Box<dyn Fn(&Daemon, &Effect) -> crate::executor::Outcome>;
 
 type Handler = Result<Value, UserError>;
 
@@ -144,8 +146,9 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         }
     }
     if let (true, Some(repo)) = (fresh_db, &state_repo) {
+        let memories = repo.reindex_memory(store.as_ref());
         match repo.reindex(store.as_ref()) {
-            Ok(n) => tracing::info!(tickets = n, "rebuilt the database from the state repo"),
+            Ok(n) => tracing::info!(tickets = n, memories, "rebuilt the database from the state repo"),
             Err(e) => tracing::warn!(%e, "reindex failed"),
         }
     }
@@ -190,7 +193,10 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         last_commit: Cell::new(Instant::now()),
         last_renew: Cell::new(Instant::now()),
         profile_mtime: Cell::new(profile_mtime),
+        workers: RefCell::new(HashMap::new()),
     };
+    let mut daemon = daemon;
+    daemon.install_handlers();
     daemon.write_info();
     match daemon.store.kv_get("daemon.version") {
         Some(previous) if previous != VERSION => tracing::info!(%previous, current = VERSION, "daemon binary changed since the last run"),
@@ -280,10 +286,32 @@ impl Daemon {
         (state, message)
     }
 
-    /// Assignments that were running when the daemon last stopped.
+    /// Assignments that were running when the daemon last stopped. A pane that
+    /// still exists with its agent is re-attached (herdr restores
+    /// conversations); otherwise the engine restarts the assignment.
     fn recover(&self) {
+        let panes = self.herdr.as_ref().and_then(|h| h.pane_list().ok()).unwrap_or_default();
         for ticket in self.store.ticket_active() {
             if let Some(running) = ticket.running_assignment() {
+                let alive = running
+                    .pane_id
+                    .as_ref()
+                    .and_then(|id| panes.iter().find(|p| &p.pane_id == id))
+                    .map(|p| p.agent.is_some())
+                    .unwrap_or(false);
+                if alive {
+                    tracing::info!(ticket = %ticket.id, pane = ?running.pane_id, "re-attached to a live worker pane");
+                    if !ticket.undelivered.is_empty() {
+                        self.store.effect_enqueue(
+                            "deliver",
+                            &ticket.id,
+                            &json!({ "ticket_id": ticket.id, "assignment_id": running.id }),
+                            herdr::seq_now() as i64,
+                            &clock::now_iso(),
+                        );
+                    }
+                    continue;
+                }
                 if let Err(e) = self.engine.assignment_interrupted(&ticket.id, &running.id) {
                     tracing::warn!(ticket = %ticket.id, %e, "recovery failed");
                 }
@@ -366,6 +394,7 @@ impl Daemon {
             tracing::warn!(%e, "evaluate_due failed");
         }
         self.drain_effects();
+        self.observe_workers();
         self.watch_profile();
         self.flush_records();
         self.register(false);
@@ -492,10 +521,13 @@ impl Daemon {
             for effect in self.store.effects_due(kind, now_ms, 8) {
                 tracing::debug!(target: "daemon", kind, key = %effect.key, attempts = effect.attempts, payload = %effect.payload, "running effect");
                 match handler(self, &effect) {
-                    Ok(()) => {
+                    crate::executor::Outcome::Done => {
                         self.store.effect_done(kind, &effect.key, effect.generation);
                     }
-                    Err(error) => {
+                    crate::executor::Outcome::Defer(ms) => {
+                        self.store.effect_defer(kind, &effect.key, now_ms + ms);
+                    }
+                    crate::executor::Outcome::Fail(error) => {
                         let backoff = (2i64.pow(effect.attempts.min(8) as u32) * 1000).min(300_000);
                         tracing::warn!(kind, key = %effect.key, %error, "effect failed");
                         self.store.effect_failed(kind, &effect.key, &error, now_ms + backoff);
@@ -592,6 +624,9 @@ impl Daemon {
             "note" => Ok(ticket_view(
                 &self.engine.note(str_param(params, "ticket")?, str_param(params, "text")?)?,
             )),
+            "memory_add" => self.memory_add(params),
+            "memory_get" => Ok(serde_json::to_value(self.store.memory_get(str_param(params, "id")?))?),
+            "memory_search" => self.memory_search(params),
             "profile" => {
                 let mut value = serde_json::to_value(self.policy.snapshot())?;
                 value["profile_path"] = json!(self.paths.profile_file());
@@ -649,7 +684,9 @@ impl Daemon {
                 None => Value::Null,
             }),
             "reindex" => match self.state_repo.borrow().as_ref() {
-                Some(repo) => Ok(json!({ "tickets": repo.reindex(self.store.as_ref()).map_err(UserError::internal)? })),
+                Some(repo) => Ok(
+                    json!({ "tickets": repo.reindex(self.store.as_ref()).map_err(UserError::internal)?, "memories": repo.reindex_memory(self.store.as_ref()) }),
+                ),
                 None => Err(UserError::internal("no state repo configured")),
             },
             other => Err(UserError::internal(format!("unknown method '{other}'"))),
@@ -689,11 +726,58 @@ impl Daemon {
             "stages": stages,
             "candidates": self.store.eval_list().len(),
             "effects": effects,
+            "workers": { "running": self.store.ticket_open().iter().filter(|t| t.running_assignment().map(|a| a.pane_id.is_some()).unwrap_or(false)).count(), "max": self.policy.snapshot().limits.max_workers },
+            "memory": self.store.memory_count(),
             "session_pane_id": self.store.kv_get("session.pane_id"),
             "harness": self.store.kv_get("session.harness").filter(|h| !h.is_empty()).unwrap_or_else(|| self.policy.snapshot().superagent.harness),
             "state_repo": self.policy.snapshot().state_repo.kind,
             "lease": self.state_repo.borrow().as_ref().and_then(|r| r.lease()).map(|l| format!("{} until {}", l.machine, l.expires)),
         }))
+    }
+
+    /// The memory project a request names: `project` (a key or a path), else the ticket's repo, else the notes bucket.
+    fn memory_project(&self, params: &Value) -> String {
+        if let Some(project) = opt_param(params, "project") {
+            return crate::memory::project_key(&project).unwrap_or(project);
+        }
+        if let Some(ticket) = opt_param(params, "ticket").and_then(|id| self.store.ticket_get(&id)) {
+            return self.ticket_project(&ticket);
+        }
+        crate::memory::NOTES_PROJECT.to_string()
+    }
+
+    fn memory_add(&self, params: &Value) -> Handler {
+        let title = str_param(params, "title")?;
+        let body = str_param(params, "body")?;
+        let project = self.memory_project(params);
+        let ticket = opt_param(params, "ticket").and_then(|id| self.store.ticket_get(&id));
+        let assignment_id = ticket.as_ref().and_then(|t| t.latest_assignment().map(|a| a.id.clone()));
+        let role = opt_param(params, "role").unwrap_or_else(|| "worker".into());
+        let entry = crate::memory::now_entry(&project, ticket.as_ref().map(|t| t.id.clone()), assignment_id, &role, title, body);
+        let entry = self.store.memory_add(&entry)?;
+        let mut file = None;
+        if let Some(repo) = self.state_repo.borrow().as_ref() {
+            let written = match &ticket {
+                Some(ticket) => repo.write_summary(ticket, &entry),
+                None => repo.write_note(&entry),
+            };
+            match written {
+                Ok(path) => file = Some(path.display().to_string()),
+                Err(e) => tracing::warn!(%e, "could not write the summary file"),
+            }
+            if let Some(ticket) = &ticket {
+                self.dirty_tickets.borrow_mut().insert(ticket.id.clone());
+            }
+        }
+        Ok(json!({ "id": entry.id, "project": entry.project, "ticket_id": entry.ticket_id, "file": file }))
+    }
+
+    fn memory_search(&self, params: &Value) -> Handler {
+        let project = self.memory_project(params);
+        let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+        let hits = self.store.memory_search(&project, query, limit)?;
+        Ok(json!({ "project": project, "hits": hits }))
     }
 
     fn submit(&self, params: &Value) -> Handler {

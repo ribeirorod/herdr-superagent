@@ -1,6 +1,7 @@
 //! herdr-superagent: a herdr plugin with one superagent session that routes
 //! your requests into tickets, runs workers in herdr panes and lets you review.
 
+mod brief;
 mod calibration;
 mod cli;
 // The executor-facing engine API (assignment lifecycle, delivery, status requests)
@@ -8,13 +9,16 @@ mod cli;
 #[allow(dead_code)]
 mod core;
 mod daemon;
+mod dashboard;
 mod ensure;
 mod envpath;
+mod executor;
 // Pane and workspace fields that phase 2's observer reads.
 #[allow(dead_code)]
 mod herdr;
 mod ipc;
 mod logging;
+mod memory;
 mod paths;
 mod profile;
 mod session;
@@ -34,6 +38,7 @@ fn main() {
     let process = match cli.command {
         cli::Command::Daemon => "daemon",
         cli::Command::Ensure | cli::Command::Start(_) | cli::Command::Action => "ensure",
+        cli::Command::Dashboard { .. } => "dashboard",
         _ => "cli",
     };
     if paths::validate_profile(&profile).is_ok() {

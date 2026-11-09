@@ -1,0 +1,168 @@
+//! The worker brief: what a worker pane reads first (PLAN §8).
+
+use crate::core::model::{Mode, Request, Ticket, TicketInput};
+use crate::memory::MemoryHit;
+
+pub const WORKER_TEMPLATE: &str = include_str!("../skills/superagent/worker.md");
+
+pub fn mode_rules(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Propose => "**Propose mode: plan only.** Investigate, write the plan, then `herdr-superagent checkpoint plan --summary \"…\"` and end your turn. Do not change files, run migrations, push or send anything until the plan is approved.",
+        Mode::Checkpoint => "**Checkpoint mode.** Work, but stop at milestones with `herdr-superagent checkpoint <name> --summary \"…\"` and before any risky action (pushing, deploying, deleting, sending messages, spending): checkpoint first, end your turn, continue only after approval. The harness's own permission prompts stay on.",
+        Mode::Autonomous => "**Autonomous mode.** Run end to end and report when done. Still: never push to a default branch, never delete outside your worktree, never send messages or spend money unless the request says so explicitly.",
+    }
+}
+
+pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, role: &str, hits: &[MemoryHit]) -> String {
+    let request_text = request.map(|r| r.text.clone()).unwrap_or_else(|| ticket.title.clone());
+    let notes: Vec<String> = ticket
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            TicketInput::Note { text, .. } => Some(format!("- note from the superagent: {text}")),
+            TicketInput::Request { note: Some(note), .. } => Some(format!("- routing note: {note}")),
+            _ => None,
+        })
+        .collect();
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("## Notes\n\n{}\n", notes.join("\n"))
+    };
+    let memory = if hits.is_empty() {
+        "## Memory\n\nNo earlier tickets of this project are recorded yet.".to_string()
+    } else {
+        let lines: Vec<String> = hits
+            .iter()
+            .map(|h| {
+                format!(
+                    "- **{}** ({}): {}",
+                    h.title,
+                    h.ticket_id.as_deref().unwrap_or("note"),
+                    h.snippet.replace('\n', " ")
+                )
+            })
+            .collect();
+        format!(
+            "## Memory: what this project's earlier tickets learned\n\n{}\n\nRun `herdr-superagent memory search \"…\"` for more.",
+            lines.join("\n")
+        )
+    };
+    WORKER_TEMPLATE
+        .replace("{ticket}", &ticket.id)
+        .replace("{role}", role)
+        .replace("{profile}", profile)
+        .replace("{title}", &ticket.title)
+        .replace("{mode}", ticket.mandate.mode.as_str())
+        .replace("{workflow}", ticket.workflow.as_deref().unwrap_or("general"))
+        .replace("{project}", ticket.project.as_deref().unwrap_or("none (no repository)"))
+        .replace("{mode_rules}", mode_rules(ticket.mandate.mode))
+        .replace("{request}", &request_text)
+        .replace("{notes}", &notes)
+        .replace("{memory}", &memory)
+}
+
+/// The text delivered to a running worker for the inputs that wait for it.
+pub fn delivery_text(
+    ticket: &Ticket,
+    requests: &dyn Fn(&str) -> Option<Request>,
+    first: Option<&std::path::Path>,
+) -> (String, Vec<String>) {
+    let mut parts = Vec::new();
+    if let Some(brief) = first {
+        parts.push(format!("Read {} and start on ticket {}.", brief.display(), ticket.id));
+    }
+    let mut ids = Vec::new();
+    for id in &ticket.undelivered {
+        let Some(input) = ticket.input(id) else { continue };
+        ids.push(id.clone());
+        match input {
+            TicketInput::Request { request_id, note, .. } => {
+                let text = requests(request_id)
+                    .map(|r| r.text)
+                    .unwrap_or_else(|| format!("request {request_id}"));
+                match note {
+                    Some(note) => parts.push(format!("New message for this ticket (superagent's note: {note}):\n{text}")),
+                    None => parts.push(format!("New message for this ticket:\n{text}")),
+                }
+            }
+            TicketInput::Text { text, .. } => parts.push(text.clone()),
+            TicketInput::Note { text, .. } => parts.push(format!("Context from the superagent (no action required): {text}")),
+            TicketInput::Resumed { .. } => parts
+                .push("This ticket was resumed by a person's message. Re-read the state of your worktree before continuing.".to_string()),
+            TicketInput::PolicyChanged { from, to, effect, .. } => {
+                let withdrawn = effect.as_ref().map(|e| e.proactive_withdrawn).unwrap_or(false);
+                parts.push(format!(
+                    "The profile changed ({from} → {to}).{}",
+                    if withdrawn {
+                        " Autonomous work is no longer allowed: checkpoint before any further action."
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
+    (parts.join("\n\n"), ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::*;
+
+    fn ticket(mode: Mode) -> Ticket {
+        Ticket {
+            id: "t-abc123".into(),
+            title: "Fix the flaky login test".into(),
+            decision_id: "d".into(),
+            mandate: Mandate {
+                strength: Strength::Explicit,
+                policy_version: "v".into(),
+                basis: MandateBasis::Explicit { workflow: None },
+                actor: "you".into(),
+                scope: "s".into(),
+                mode,
+            },
+            project: Some("acme/api".into()),
+            workflow: Some("software-dev".into()),
+            ended: None,
+            attention: None,
+            checkpoint: None,
+            assignments: vec![],
+            inputs: vec![TicketInput::Note {
+                id: "n1".into(),
+                text: "tests live in tests/login".into(),
+                at: "t".into(),
+            }],
+            undelivered: vec!["n1".into()],
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            origin: Origin { request_id: "r1".into() },
+            execution: None,
+            delivery: None,
+        }
+    }
+
+    #[test]
+    fn renders_mode_rules_notes_and_memory() {
+        let hits = vec![MemoryHit {
+            id: "m".into(),
+            project: "acme/api".into(),
+            ticket_id: Some("t-old".into()),
+            title: "t-old worker: login cache".into(),
+            snippet: "race in [login] cache".into(),
+            created_at: "t".into(),
+        }];
+        let text = render("work", &ticket(Mode::Propose), None, "worker", &hits);
+        assert!(text.contains("# Worker brief · ticket t-abc123 · worker"));
+        assert!(text.contains("Propose mode: plan only"));
+        assert!(text.contains("note from the superagent: tests live in tests/login"));
+        assert!(text.contains("t-old worker: login cache"));
+        assert!(text.contains("SUPERAGENT_TICKET"));
+        let (delivery, ids) = delivery_text(&ticket(Mode::Checkpoint), &|_| None, Some(std::path::Path::new("/b/brief.md")));
+        assert!(delivery.starts_with("Read /b/brief.md and start on ticket t-abc123."));
+        assert!(delivery.contains("Context from the superagent"));
+        assert_eq!(ids, vec!["n1".to_string()]);
+    }
+}

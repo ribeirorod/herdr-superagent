@@ -114,6 +114,7 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
             let (workspace_id, root_pane) = herdr.workspace_create(&home, &label, &env, focus).map_err(|e| e.to_string())?;
             let panes = herdr.pane_list().map_err(|e| e.to_string())?;
             let tab_id = panes.iter().find(|p| p.pane_id == root_pane).map(|p| p.tab_id.clone());
+            let state_dir = paths.state_dir().display().to_string();
             let layout = herdr
                 .call(
                     "layout.apply",
@@ -122,15 +123,18 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                         "tab_id": tab_id,
                         "tab_label": "cockpit",
                         "focus": focus,
-                        "root": cockpit_layout(profile_name, &paths.profile_dir().display().to_string(), paths.state_dir().display().to_string().as_str(), &command),
+                        "root": cockpit_layout(profile_name, &paths.profile_dir().display().to_string(), &state_dir, &dashboard_command(profile_name)),
                     }),
                 )
                 .map_err(|e| e.to_string())?;
+            let daemon_tab = herdr
+                .call("layout.apply", json!({ "workspace_id": workspace_id, "tab_label": "daemon", "focus": false, "root": daemon_layout(profile_name, &state_dir, &command) }))
+                .map_err(|e| e.to_string())?;
             let _ = herdr.report_workspace_metadata(&workspace_id, &[("sa_profile", profile_name)], crate::herdr::seq_now());
             report.workspace_id = Some(workspace_id);
-            let (session, daemon) = layout_panes(&layout);
+            let (session, _) = layout_panes(&layout);
             report.session_pane_id = session;
-            report.daemon_pane_id = daemon;
+            report.daemon_pane_id = layout_panes(&daemon_tab).1;
             report.outcome = EnsureOutcome::Created;
         }
         Some(workspace) => {
@@ -152,22 +156,35 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                     report.daemon_pane_id = Some(pane.pane_id.clone());
                 }
                 None => {
-                    let layout = herdr
+                    let state_dir = paths.state_dir().display().to_string();
+                    let daemon_tab = herdr
                         .layout_apply(
                             &workspace.workspace_id,
-                            "cockpit",
-                            cockpit_layout(
-                                profile_name,
-                                &paths.profile_dir().display().to_string(),
-                                paths.state_dir().display().to_string().as_str(),
-                                &command,
-                            ),
-                            focus,
+                            "daemon",
+                            daemon_layout(profile_name, &state_dir, &command),
+                            false,
                         )
                         .map_err(|e| e.to_string())?;
-                    let (session, daemon) = layout_panes(&layout);
-                    report.session_pane_id = session;
-                    report.daemon_pane_id = daemon;
+                    report.daemon_pane_id = layout_panes(&daemon_tab).1;
+                    if !panes
+                        .iter()
+                        .any(|p| p.workspace_id == workspace.workspace_id && p.label.as_deref() == Some("dashboard"))
+                    {
+                        let cockpit = herdr
+                            .layout_apply(
+                                &workspace.workspace_id,
+                                "cockpit",
+                                cockpit_layout(
+                                    profile_name,
+                                    &paths.profile_dir().display().to_string(),
+                                    &state_dir,
+                                    &dashboard_command(profile_name),
+                                ),
+                                focus,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        report.session_pane_id = layout_panes(&cockpit).0;
+                    }
                 }
             }
             if focus {
@@ -205,23 +222,40 @@ fn forwarded_env() -> Vec<(&'static str, String)> {
 /// the right. Phase 6 replaces the daemon pane's output with the dashboard.
 /// The session runs in the profile directory, so a harness's folder trust
 /// covers that directory rather than all of `$HOME`.
-fn cockpit_layout(profile: &str, session_dir: &str, state_dir: &str, daemon_command: &[String]) -> Value {
-    let debug = if crate::logging::debug_enabled(false) { "1" } else { "" };
-    let path_env = crate::envpath::full_path();
-    let env = |role: &str| {
-        let mut env = json!({ "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": role, "HERDR_SUPERAGENT_DEBUG": debug, "PATH": path_env });
-        for (key, value) in forwarded_env() {
-            env[key] = json!(value);
-        }
-        env
-    };
+fn cockpit_layout(profile: &str, session_dir: &str, state_dir: &str, dashboard_command: &[String]) -> Value {
+    let env = pane_env(profile);
     json!({
         "type": "split",
         "direction": "right",
         "ratio": 0.65,
         "first": { "type": "pane", "label": "superagent", "cwd": session_dir, "env": env("superagent") },
-        "second": { "type": "pane", "label": "daemon", "cwd": state_dir, "command": daemon_command, "env": env("daemon") }
+        "second": { "type": "pane", "label": "dashboard", "cwd": state_dir, "command": dashboard_command, "env": env("dashboard") }
     })
+}
+
+/// The daemon's own tab: its log is the console (PLAN §8b).
+fn daemon_layout(profile: &str, state_dir: &str, daemon_command: &[String]) -> Value {
+    let env = pane_env(profile);
+    json!({ "type": "pane", "label": "daemon", "cwd": state_dir, "command": daemon_command, "env": env("daemon") })
+}
+
+fn pane_env(profile: &str) -> impl Fn(&str) -> Value + '_ {
+    let debug = if crate::logging::debug_enabled(false) { "1" } else { "" };
+    let path_env = crate::envpath::full_path();
+    move |role: &str| {
+        let mut env = json!({ "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": role, "HERDR_SUPERAGENT_DEBUG": debug, "PATH": path_env });
+        for (key, value) in forwarded_env() {
+            env[key] = json!(value);
+        }
+        env
+    }
+}
+
+/// The argv that runs the dashboard in the cockpit's right pane.
+pub fn dashboard_command(profile: &str) -> Vec<String> {
+    let mut argv = daemon_command(profile);
+    argv[1] = "dashboard".into();
+    argv
 }
 
 /// The pane ids of the session and daemon panes from a `layout.apply` result.
