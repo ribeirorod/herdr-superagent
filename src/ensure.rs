@@ -100,11 +100,13 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
     // The shell that runs `start` has the full PATH; herdr panes often get a non-login one.
     // herdr panes often get a non-login PATH: give them the login shell's, merged with ours.
     let path_env = crate::envpath::full_path();
-    let env = [
-        ("SUPERAGENT_PROFILE", profile_name),
-        ("HERDR_SUPERAGENT_DEBUG", debug_flag),
-        ("PATH", path_env.as_str()),
+    let mut env = vec![
+        ("SUPERAGENT_PROFILE", profile_name.to_string()),
+        ("HERDR_SUPERAGENT_DEBUG", debug_flag.to_string()),
+        ("PATH", path_env),
     ];
+    env.extend(forwarded_env());
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let command = daemon_command(profile_name);
     tracing::debug!(target: "ensure", ?command, debug_mode = debug_flag, "daemon command");
     match find_workspace(&herdr, profile_name)? {
@@ -171,13 +173,28 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
     Ok(report)
 }
 
+/// Overrides set in the shell that runs `start`, which the panes must share:
+/// without the state and config roots the daemon would open another profile
+/// directory and listen on another socket.
+fn forwarded_env() -> Vec<(&'static str, String)> {
+    ["HERDR_SUPERAGENT_STATE_DIR", "HERDR_SUPERAGENT_CONFIG_DIR", "HERDR_SUPERAGENT_LOG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()).map(|v| (key, v)))
+        .collect()
+}
+
 /// The cockpit (PLAN §8b): the superagent session on the left, the daemon on
 /// the right. Phase 6 replaces the daemon pane's output with the dashboard.
 fn cockpit_layout(profile: &str, home: &str, state_dir: &str, daemon_command: &[String]) -> Value {
     let debug = if crate::logging::debug_enabled(false) { "1" } else { "" };
     let path_env = crate::envpath::full_path();
-    let env =
-        |role: &str| json!({ "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": role, "HERDR_SUPERAGENT_DEBUG": debug, "PATH": path_env });
+    let env = |role: &str| {
+        let mut env = json!({ "SUPERAGENT_PROFILE": profile, "SUPERAGENT_ROLE": role, "HERDR_SUPERAGENT_DEBUG": debug, "PATH": path_env });
+        for (key, value) in forwarded_env() {
+            env[key] = json!(value);
+        }
+        env
+    };
     json!({
         "type": "split",
         "direction": "right",
