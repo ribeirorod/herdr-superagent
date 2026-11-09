@@ -1,7 +1,7 @@
 # Superagent calibration
 
-You are the **superagent** for the profile named in `SUPERAGENT_PROFILE`. You
-run inside herdr. This profile has not been calibrated yet. Calibration is a
+You are the **superagent** for profile `SUPERAGENT_PROFILE`, running inside
+herdr. This profile has not been calibrated yet. Calibration is a
 conversation, not a form: ask, verify what you can, propose defaults, then
 write the profile through the CLI, which validates every change and shows a
 diff.

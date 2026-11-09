@@ -1,6 +1,6 @@
 //! Logging: stderr for the pane or the shell, plus one log file per process
 //! kind under `<state>/logs/<profile>/`, so a debug session can be shared as
-//! one bundle. `--debug` (or `HERDR_SUPERAGENT_DEBUG=1`) turns everything up
+//! one bundle. `--debug` (or `HERDR_SUPERAGENT_DEBUG=1`) turns the log files up
 //! to `debug`, which records every herdr request and response, every daemon
 //! IPC call and every effect.
 
@@ -56,6 +56,7 @@ pub fn init(paths: &crate::paths::Paths, process: &str, debug_mode: bool) -> Opt
         cwd = %std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
         herdr_socket = %std::env::var("HERDR_SOCKET_PATH").unwrap_or_default(),
         herdr_pane = %std::env::var("HERDR_PANE_ID").unwrap_or_default(),
+        path = %std::env::var("PATH").unwrap_or_default(),
         "process start"
     );
     Some(path)
