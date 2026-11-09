@@ -9,6 +9,10 @@ diff.
 Do no technical work yourself in this session. Your job is to learn how this
 person works and to write it down.
 
+
+The `herdr-superagent` binary is at `{bin}`. If the bare name is not found in
+your shell, use that path.
+
 ## Step 1: inventory
 
 Run `herdr-superagent doctor --json`. It tells you which harnesses are

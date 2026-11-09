@@ -49,6 +49,8 @@ pub struct WorkspaceInfo {
     #[serde(default)]
     pub label: String,
     #[serde(default)]
+    pub tokens: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub focused: bool,
     #[serde(default)]
     pub active_tab_id: String,
@@ -68,6 +70,8 @@ pub struct PaneInfo {
     pub agent_status: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub tokens: std::collections::HashMap<String, String>,
 }
 
 pub struct Herdr {
@@ -234,6 +238,25 @@ impl Herdr {
             params["title"] = Value::String(title.to_string());
         }
         self.call("pane.report_metadata", params).map(|_| ())
+    }
+
+    /// Clears our title and `sa_*` tokens from a pane.
+    pub fn clear_pane_metadata(&self, pane_id: &str, tokens: &[String]) -> Result<(), HerdrError> {
+        let tokens: serde_json::Map<String, Value> = tokens.iter().map(|k| (k.clone(), Value::Null)).collect();
+        self.call(
+            "pane.report_metadata",
+            json!({ "pane_id": pane_id, "source": SOURCE, "agent": AGENT, "tokens": tokens, "clear_title": true }),
+        )
+        .map(|_| ())
+    }
+
+    pub fn clear_workspace_metadata(&self, workspace_id: &str, tokens: &[String]) -> Result<(), HerdrError> {
+        let tokens: serde_json::Map<String, Value> = tokens.iter().map(|k| (k.clone(), Value::Null)).collect();
+        self.call(
+            "workspace.report_metadata",
+            json!({ "workspace_id": workspace_id, "source": SOURCE, "tokens": tokens, "seq": seq_now() }),
+        )
+        .map(|_| ())
     }
 
     pub fn report_workspace_metadata(&self, workspace_id: &str, tokens: &[(&str, &str)], seq: u64) -> Result<(), HerdrError> {

@@ -60,6 +60,7 @@ pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, role: &
         .replace("{request}", &request_text)
         .replace("{notes}", &notes)
         .replace("{memory}", &memory)
+        .replace("{bin}", &crate::envpath::self_path())
 }
 
 /// The text delivered to a running worker for the inputs that wait for it.

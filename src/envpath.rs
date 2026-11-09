@@ -61,6 +61,15 @@ pub fn full_path() -> String {
     .clone()
 }
 
+/// This binary's absolute path, symlinks resolved: what briefs tell agents to
+/// run when a bare `herdr-superagent` is not on their shell's PATH.
+pub fn self_path() -> String {
+    std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "herdr-superagent".to_string())
+}
+
 /// Finds an executable on the full PATH: (path, on the current PATH).
 pub fn locate(name: &str) -> Option<(String, bool)> {
     let current = std::env::var("PATH").unwrap_or_default();

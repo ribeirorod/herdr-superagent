@@ -97,27 +97,52 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
     }
 
     let args = calibration::model_args(&harness, &model);
-    herdr
-        .call(
+    // The pane's shell may have a short PATH: export the login shell's before the harness starts.
+    let exports = [
+        format!("PATH={}", crate::envpath::full_path()),
+        format!("SUPERAGENT_PROFILE={profile_name}"),
+        "SUPERAGENT_ROLE=superagent".to_string(),
+    ];
+    let _ = herdr.pane_run(&pane.pane_id, &format!("export {}; clear", crate::ensure::shell_words(&exports)));
+    std::thread::sleep(Duration::from_millis(800));
+    let start = || {
+        herdr.call(
             "agent.start",
             json!({ "name": agent_name(profile_name), "kind": harness, "pane_id": pane.pane_id, "args": args, "timeout_ms": 60000 }),
         )
-        .map_err(|e| format!("agent.start {harness} in {}: {e}", pane.pane_id))?;
+    };
+    start().map_err(|e| format!("agent.start {harness} in {}: {e}", pane.pane_id))?;
+    // A brand-new pane sometimes swallows the first typed command: check an agent appeared, else start once more.
+    let _ = herdr.call_with_timeout(
+        "agent.wait",
+        json!({ "target": pane.pane_id, "until": ["idle", "done", "blocked", "working"], "timeout_ms": 20000 }),
+        Duration::from_secs(25),
+    );
+    let has_agent = herdr
+        .pane_list()
+        .ok()
+        .and_then(|p| p.into_iter().find(|p| p.pane_id == pane.pane_id))
+        .map(|p| p.agent.is_some())
+        .unwrap_or(false);
+    if !has_agent {
+        tracing::warn!(pane = %pane.pane_id, "no agent detected after agent.start; starting once more");
+        let _ = herdr.pane_run(&pane.pane_id, "clear");
+        std::thread::sleep(Duration::from_millis(800));
+        start().map_err(|e| format!("agent.start {harness} in {} (second try): {e}", pane.pane_id))?;
+    }
 
     // The brief goes to a file; the prompt stays one line.
     let (kind, text) = if profile.calibrated {
         ("brief", calibration::brief(&profile, &paths.profile_dir()))
     } else {
-        (
-            "calibration",
-            calibration::CALIBRATION_PROMPT.replace("`SUPERAGENT_PROFILE`", &format!("`{profile_name}`")),
-        )
+        ("calibration", calibration::calibration(profile_name))
     };
     let brief_path = paths.state_dir().join("brief.md");
     std::fs::write(&brief_path, &text).map_err(|e| e.to_string())?;
     let prompt = format!(
-        "You are the superagent for herdr profile '{profile_name}'. Read {} and follow it. Start by running `herdr-superagent status`.",
-        brief_path.display()
+        "You are the superagent for herdr profile '{profile_name}'. Read {} and follow it. Start by running `{} status`.",
+        brief_path.display(),
+        crate::envpath::self_path()
     );
     // The workspace and daemon are up either way: a session that never took the
     // prompt is reported, not an error.

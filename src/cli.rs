@@ -122,6 +122,12 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ProfileAction>,
     },
+    /// Clear this profile's titles and `sa_*` tokens from herdr panes and workspaces (after a test run).
+    Cleanup {
+        /// Clear every `sa_*` token herdr still holds, whatever the profile.
+        #[arg(long)]
+        all: bool,
+    },
     /// Dispatch a herdr plugin action (reads HERDR_PLUGIN_ACTION_ID).
     #[command(hide = true)]
     Action,
@@ -696,6 +702,39 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             out(
                 json!({ "saved": true, "diff": lines, "mode_changes": changes, "from": before.version(), "to": after.version() }),
                 text,
+            )
+        }
+        Command::Cleanup { all } => {
+            let herdr = crate::herdr::Herdr::from_env().map_err(|e| e.to_string())?;
+            let mine = |tokens: &std::collections::HashMap<String, String>| {
+                let ours: Vec<String> = tokens.keys().filter(|k| k.starts_with("sa_")).cloned().collect();
+                let matches = all
+                    || tokens.get("sa_profile").map(|p| p == &profile).unwrap_or(false)
+                    || (tokens.contains_key("sa_ticket") && !tokens.contains_key("sa_profile"));
+                (matches && !ours.is_empty()).then_some(ours)
+            };
+            let mut cleared = Vec::new();
+            for pane in herdr.pane_list().map_err(|e| e.to_string())? {
+                if let Some(tokens) = mine(&pane.tokens) {
+                    herdr.clear_pane_metadata(&pane.pane_id, &tokens).map_err(|e| e.to_string())?;
+                    cleared.push(pane.pane_id);
+                }
+            }
+            for workspace in herdr.workspace_list().map_err(|e| e.to_string())? {
+                if let Some(tokens) = mine(&workspace.tokens) {
+                    herdr
+                        .clear_workspace_metadata(&workspace.workspace_id, &tokens)
+                        .map_err(|e| e.to_string())?;
+                    cleared.push(workspace.workspace_id);
+                }
+            }
+            out(
+                json!({ "cleared": cleared }),
+                if cleared.is_empty() {
+                    "nothing to clear".to_string()
+                } else {
+                    format!("cleared {}", cleared.join(", "))
+                },
             )
         }
         Command::Action => action(&profile, &paths),

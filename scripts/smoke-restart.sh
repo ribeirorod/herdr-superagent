@@ -11,8 +11,6 @@
 set -eu
 profile=${SUPERAGENT_PROFILE:-smoke}
 herdr=${HERDR_BIN_PATH:-herdr}
-state=${HERDR_SUPERAGENT_STATE_DIR:-$HOME/.local/share/herdr-superagent}
-sock="$state/profiles/$profile/daemon.sock"
 
 herdr-superagent --profile "$profile" ensure --json
 before=$(herdr-superagent --profile "$profile" status --json)
@@ -31,7 +29,7 @@ else
 fi
 
 for _ in $(seq 1 60); do
-  if [ -S "$sock" ] && after=$(herdr-superagent --profile "$profile" status --json 2>/dev/null); then
+  if after=$(herdr-superagent --profile "$profile" status --json 2>/dev/null); then
     pid_after=$(printf '%s' "$after" | sed -n 's/.*"pid": *\([0-9]*\).*/\1/p')
     pane_after=$(printf '%s' "$after" | sed -n 's/.*"pane_id": *"\([^"]*\)".*/\1/p')
     echo "after:  pid=$pid_after pane=$pane_after"

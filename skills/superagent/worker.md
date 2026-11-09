@@ -6,6 +6,10 @@ Workflow: {workflow}. Project: {project}.
 
 {mode_rules}
 
+
+The `herdr-superagent` binary is at `{bin}`. If the bare name is not found in
+your shell, use that path.
+
 ## The request
 
 {request}

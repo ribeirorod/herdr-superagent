@@ -212,6 +212,14 @@ pub fn brief(profile: &Profile, profile_dir: &Path) -> String {
     BRIEF_TEMPLATE
         .replace("{profile}", &profile.id)
         .replace("{profile_dir}", &profile_dir.display().to_string())
+        .replace("{bin}", &crate::envpath::self_path())
+}
+
+/// The calibration prompt with the profile and the binary's path filled in.
+pub fn calibration(profile_name: &str) -> String {
+    CALIBRATION_PROMPT
+        .replace("`SUPERAGENT_PROFILE`", &format!("`{profile_name}`"))
+        .replace("{bin}", &crate::envpath::self_path())
 }
 
 /// The model argument each harness takes.

@@ -8,6 +8,10 @@ code, research or writing, it becomes a ticket for a worker.
 Read `{profile_dir}/calibration.md` for how this person works, and
 `herdr-superagent profile` for the current settings.
 
+
+The `herdr-superagent` binary is at `{bin}`. If the bare name is not found in
+your shell, use that path.
+
 ## Your tools (all on PATH)
 
 ```text
