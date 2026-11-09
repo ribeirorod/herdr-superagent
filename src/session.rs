@@ -97,10 +97,15 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
     }
 
     let args = calibration::model_args(&harness, &model);
+    // herdr agent names are unique across the session: one per profile.
+    let slug: String = profile_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     herdr
         .call(
             "agent.start",
-            json!({ "name": "superagent", "kind": harness, "pane_id": pane.pane_id, "args": args, "timeout_ms": 60000 }),
+            json!({ "name": format!("superagent-{slug}"), "kind": harness, "pane_id": pane.pane_id, "args": args, "timeout_ms": 60000 }),
         )
         .map_err(|e| format!("agent.start {harness} in {}: {e}", pane.pane_id))?;
 
