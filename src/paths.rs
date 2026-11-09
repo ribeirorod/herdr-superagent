@@ -57,15 +57,15 @@ impl Paths {
     }
     /// The daemon's socket. Unix socket paths are limited to about 100 bytes
     /// (104 on macOS), so a long state directory falls back to a short
-    /// per-user path under the temp directory.
+    /// per-user path under `/tmp` (macOS's `$TMPDIR` is itself ~50 bytes).
     pub fn socket_path(&self) -> PathBuf {
         let preferred = self.state_dir().join("daemon.sock");
         if preferred.as_os_str().len() < 90 {
             return preferred;
         }
         let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        std::env::temp_dir()
-            .join(format!("herdr-superagent-{user}"))
+        PathBuf::from("/tmp")
+            .join(format!("herdr-sa-{user}"))
             .join(format!("{}.sock", self.profile))
     }
     pub fn daemon_info_path(&self) -> PathBuf {
@@ -80,6 +80,12 @@ impl Paths {
         std::fs::create_dir_all(self.state_dir())?;
         if let Some(parent) = self.socket_path().parent() {
             std::fs::create_dir_all(parent)?;
+            // The /tmp fallback is shared: keep the socket's directory private.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         Ok(())
     }
