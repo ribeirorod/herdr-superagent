@@ -67,14 +67,18 @@ git clone https://github.com/ribeirorod/herdr-superagent ~/src/herdr-superagent
 cd ~/src/herdr-superagent
 cargo build --release
 mkdir -p bin ~/.local/bin
-cp target/release/herdr-superagent bin/
+rm -f bin/herdr-superagent && cp target/release/herdr-superagent bin/   # replace, never overwrite (macOS kills an overwritten binary)
 ln -sf "$PWD/bin/herdr-superagent" ~/.local/bin/herdr-superagent   # must be on PATH
 herdr plugin link ~/src/herdr-superagent                            # from a herdr pane
 herdr-superagent --debug start --profile test
 ```
 
-Rebuild and `herdr-superagent ensure` after pulling: the daemon notices the
-new version and restarts itself in its pane.
+After pulling: `cargo build --release && rm -f bin/herdr-superagent && cp
+target/release/herdr-superagent bin/ && herdr-superagent ensure`. The daemon
+notices the new version and restarts itself in its pane. On macOS never `cp`
+over the existing binary: the kernel caches its code signature and kills every
+launch with `killed`; replace the file or run
+`codesign --force --sign - bin/herdr-superagent`.
 
 ## Debugging
 

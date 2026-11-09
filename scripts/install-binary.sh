@@ -29,7 +29,11 @@ esac
 asset="herdr-superagent-$os-$arch"
 url="https://github.com/$repo/releases/download/v$version/$asset"
 
-if [ -x "$target" ] && [ "$("$target" --version 2>/dev/null | awk '{print $2}')" = "$version" ]; then
+if [ -x "$target" ] && [ "$(if [ "$os" = macos ] && command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "$target" 2>/dev/null || true
+fi
+
+"$target" --version 2>/dev/null | awk '{print $2}')" = "$version" ]; then
   echo "install-binary: bin/herdr-superagent $version already present"
 else
   tmp="$target.download"
@@ -42,6 +46,8 @@ else
     if command -v cargo >/dev/null 2>&1; then
       echo "install-binary: no release asset at $url; building with cargo (this takes a few minutes)"
       (cd "$root" && cargo build --release --locked)
+      # Replace, never overwrite in place: macOS caches the code signature per file and kills a binary copied over an old one.
+      rm -f "$target"
       cp "$root/target/release/herdr-superagent" "$target"
     else
       echo "install-binary: no release asset at $url and no cargo on PATH" >&2
