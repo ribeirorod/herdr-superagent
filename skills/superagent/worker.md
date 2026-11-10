@@ -10,6 +10,10 @@ Workflow: {workflow}. Project: {project}.
 The `herdr-superagent` binary is at `{bin}`. If the bare name is not found in
 your shell, use that path.
 
+## Your branch
+
+{branch}
+
 ## The request
 
 {request}

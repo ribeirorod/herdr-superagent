@@ -408,6 +408,9 @@ pub struct Execution {
     pub name: String,
     /// The worktree (or project directory) every role of the ticket works in.
     pub directory: String,
+    /// The git branch the ticket's worktree is on, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The path of the latest brief.
     pub assignment: String,
     /// The herdr workspace that holds the ticket: one per ticket, one tab per assignment.
@@ -443,6 +446,9 @@ pub struct Ticket {
     pub attention: Option<Attention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
+    /// Names of the checkpoints a person approved, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_checkpoints: Vec<String>,
     pub assignments: Vec<Assignment>,
     pub inputs: Vec<TicketInput>,
     /// Inputs not yet handed to a running assignment.

@@ -93,8 +93,19 @@ fn render(profile: &str, paths: &Paths) -> String {
                 .and_then(Value::as_str)
                 .map(|c| format!(" ⏸ {c}"))
                 .unwrap_or_default();
+            let branch = t
+                .pointer("/execution/branch")
+                .and_then(Value::as_str)
+                .filter(|_| t["stage"] == "ended")
+                .map(|b| format!(" ⎇ {b}"))
+                .unwrap_or_default();
+            let tail = if report.is_empty() {
+                String::new()
+            } else {
+                format!("{DIM}  {report}{RESET}")
+            };
             lines.push(format!(
-                "  {} {:<9} {:<11} {:<6} {}{}{}{}",
+                "  {} {:<9} {:<11} {:<6} {}{}{}{}{}",
                 t["id"].as_str().unwrap_or(""),
                 t["stage"].as_str().unwrap_or("").split('/').next_back().unwrap_or(""),
                 t["mode"].as_str().unwrap_or(""),
@@ -102,11 +113,8 @@ fn render(profile: &str, paths: &Paths) -> String {
                 t["title"].as_str().unwrap_or("").chars().take(34).collect::<String>(),
                 checkpoint,
                 question,
-                if report.is_empty() {
-                    String::new()
-                } else {
-                    format!("{DIM}  {report}{RESET}")
-                }
+                branch,
+                tail
             ));
         }
         lines.push(String::new());

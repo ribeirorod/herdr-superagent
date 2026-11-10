@@ -101,6 +101,8 @@ pub(crate) struct Daemon {
     pub(crate) dirty_tickets: RefCell<std::collections::BTreeSet<String>>,
     pub(crate) last_commit: Cell<Instant>,
     pub(crate) last_renew: Cell<Instant>,
+    pub(crate) last_tidy: Cell<Instant>,
+    pub(crate) needs_you_seen: Cell<usize>,
     pub(crate) profile_mtime: Cell<Option<std::time::SystemTime>>,
     /// What the observer last saw of each worker pane.
     pub(crate) workers: RefCell<HashMap<String, crate::executor::WorkerSeen>>,
@@ -192,6 +194,8 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         dirty_tickets: RefCell::new(std::collections::BTreeSet::new()),
         last_commit: Cell::new(Instant::now()),
         last_renew: Cell::new(Instant::now()),
+        last_tidy: Cell::new(Instant::now()),
+        needs_you_seen: Cell::new(0),
         profile_mtime: Cell::new(profile_mtime),
         workers: RefCell::new(HashMap::new()),
     };
@@ -272,13 +276,17 @@ impl Daemon {
             .iter()
             .filter(|t| matches!(ticket_stage(t), crate::core::stage::TicketStage::Working { .. }))
             .count();
-        let state = if needs_you > 0 {
-            "blocked"
-        } else if working > 0 {
-            "working"
-        } else {
-            "idle"
-        };
+        // `blocked` would read as a stuck daemon: the count goes in the message and a toast instead.
+        let state = if working > 0 { "working" } else { "idle" };
+        let previous = self.needs_you_seen.replace(needs_you);
+        if needs_you > previous {
+            if let Some(herdr) = &self.herdr {
+                let _ = herdr.notify(
+                    &format!("superagent · {}: {needs_you} need you", self.paths.profile),
+                    Some("open the cockpit to review"),
+                );
+            }
+        }
         let mut message = format!("{} · {} open", self.paths.profile, tickets.len());
         if needs_you > 0 {
             message.push_str(&format!(" · {needs_you} need you"));
@@ -395,9 +403,35 @@ impl Daemon {
         }
         self.drain_effects();
         self.observe_workers();
+        self.auto_tidy();
         self.watch_profile();
         self.flush_records();
         self.register(false);
+    }
+
+    /// Closes the workspaces of tickets that ended `limits.tidy_after_minutes` ago (PLAN §8b).
+    fn auto_tidy(&self) {
+        let minutes = self.policy.snapshot().limits.tidy_after_minutes;
+        let Some(herdr) = &self.herdr else { return };
+        if minutes == 0 || self.last_tidy.get().elapsed() < Duration::from_secs(60) {
+            return;
+        }
+        self.last_tidy.set(Instant::now());
+        let cutoff = clock::plus_ms(&clock::now_iso(), -(minutes as i64) * 60_000);
+        let Ok(open) = herdr.workspace_list() else { return };
+        for ticket in self.store.ticket_list() {
+            let (Some(ended), Some(execution)) = (&ticket.ended, &ticket.execution) else {
+                continue;
+            };
+            let Some(workspace) = &execution.workspace_id else { continue };
+            if ended.at > cutoff || !open.iter().any(|w| &w.workspace_id == workspace) {
+                continue;
+            }
+            match herdr.call("workspace.close", json!({ "workspace_id": workspace })) {
+                Ok(_) => tracing::info!(ticket = %ticket.id, workspace, "closed the ended ticket's workspace"),
+                Err(e) => tracing::debug!(ticket = %ticket.id, %e, "tidy skipped"),
+            }
+        }
     }
 
     /// `profile set` from another process: reload and tell the engine.

@@ -46,6 +46,7 @@ impl Engine {
             ended: None,
             attention: None,
             checkpoint: None,
+            approved_checkpoints: Vec::new(),
             assignments: Vec::new(),
             inputs: Vec::new(),
             undelivered: Vec::new(),
@@ -59,6 +60,7 @@ impl Engine {
                 directory: String::new(),
                 assignment: String::new(),
                 workspace_id: None,
+                branch: None,
             }),
             delivery: None,
         };
@@ -447,6 +449,7 @@ impl Engine {
         let Some(checkpoint) = ticket.checkpoint.take() else {
             return Err(UserError::new(ErrorCode::NoCheckpoint));
         };
+        ticket.approved_checkpoints.push(checkpoint.name.clone());
         let at = self.now();
         let mut text = format!("Checkpoint '{}' approved. Continue with the next step.", checkpoint.name);
         if let Some(comment) = comment.filter(|c| !c.trim().is_empty()) {

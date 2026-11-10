@@ -520,6 +520,7 @@ mod tests {
             ended: None,
             attention: None,
             checkpoint: None,
+            approved_checkpoints: Vec::new(),
             assignments: vec![],
             inputs: vec![],
             undelivered: vec![],

@@ -110,6 +110,8 @@ pub struct HarnessModel {
 #[serde(default)]
 pub struct Limits {
     pub max_workers: u32,
+    /// Close an ended ticket's workspace after this many minutes; 0 keeps it until `tidy`.
+    pub tidy_after_minutes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,7 +181,10 @@ impl Default for SuperagentSection {
 }
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_workers: 3 }
+        Limits {
+            max_workers: 3,
+            tidy_after_minutes: 60,
+        }
     }
 }
 impl Default for Modes {

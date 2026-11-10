@@ -8,8 +8,18 @@ pub const WORKER_TEMPLATE: &str = include_str!("../skills/superagent/worker.md")
 pub fn mode_rules(mode: Mode) -> &'static str {
     match mode {
         Mode::Propose => "**Propose mode: plan only.** Investigate, write the plan, then `herdr-superagent checkpoint plan --summary \"…\"` and end your turn. Do not change files, run migrations, push or send anything until the plan is approved.",
-        Mode::Checkpoint => "**Checkpoint mode.** Work, but stop at milestones with `herdr-superagent checkpoint <name> --summary \"…\"` and before any risky action (pushing, deploying, deleting, sending messages, spending): checkpoint first, end your turn, continue only after approval. The harness's own permission prompts stay on.",
+        Mode::Checkpoint => "**Checkpoint mode.** Your **first checkpoint is `plan`**, before you change any file: investigate, write the plan, run `herdr-superagent checkpoint plan --summary \"…\"` and end your turn. After approval, work and stop again at milestones (`checkpoint implemented`, `checkpoint tested`) and before any risky action (pushing, deploying, deleting, sending messages, spending). A `ready` report is refused until a checkpoint was approved. The harness's own permission prompts stay on.",
         Mode::Autonomous => "**Autonomous mode.** Run end to end and report when done. Still: never push to a default branch, never delete outside your worktree, never send messages or spend money unless the request says so explicitly.",
+    }
+}
+
+/// What a worker does with its branch (PLAN §8a: push work in progress at each checkpoint).
+pub fn branch_rules(ticket: &Ticket) -> String {
+    match ticket.execution.as_ref().and_then(|e| e.branch.as_deref()) {
+        Some(branch) => format!(
+            "You work in a worktree on branch `{branch}`. Commit as you go. At every checkpoint and before your final report, push the branch (`git push -u origin {branch}`) when the repository has a remote; never push to the default branch, and never open a pull request unless the request asks for one. Put the branch and the last commit in your final report."
+        ),
+        None => "This ticket has no repository branch. Put the files you produced in your final report.".to_string(),
     }
 }
 
@@ -58,6 +68,7 @@ pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, role: &
         .replace("{project}", ticket.project.as_deref().unwrap_or("none (no repository)"))
         .replace("{mode_rules}", mode_rules(ticket.mandate.mode))
         .replace("{request}", &request_text)
+        .replace("{branch}", &branch_rules(ticket))
         .replace("{notes}", &notes)
         .replace("{memory}", &memory)
         .replace("{bin}", &crate::envpath::self_path())
@@ -134,6 +145,7 @@ pub(crate) mod tests {
             ended: None,
             attention: None,
             checkpoint: None,
+            approved_checkpoints: Vec::new(),
             assignments: vec![],
             inputs: vec![TicketInput::Note {
                 id: "n1".into(),

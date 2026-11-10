@@ -139,6 +139,10 @@ impl Engine {
         if matches!(report.question, Question::Ask(_)) && report.state == ReportState::Ready {
             return Err(UserError::new(ErrorCode::QuestionWithResult));
         }
+        // Checkpoint and propose modes mean a person reviews before the work counts as done.
+        if report.state == ReportState::Ready && ticket.mandate.mode != Mode::Autonomous && ticket.approved_checkpoints.is_empty() {
+            return Err(UserError::new(ErrorCode::CheckpointRequired).with("mode", ticket.mandate.mode.as_str()));
+        }
         let at = self.now();
         let index = ticket
             .assignments

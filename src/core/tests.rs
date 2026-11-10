@@ -238,7 +238,17 @@ impl Harness {
         self.pump();
         self.accept(&self.last_candidate()).ticket_id.unwrap()
     }
+    /// A worker's report; a `ready` report in a reviewed mode first goes through an approved checkpoint, as a real worker would.
     fn report(&self, ticket: &str, state: ReportState, summary: &str) -> Ticket {
+        if state == ReportState::Ready {
+            let current = self.ticket(ticket);
+            if current.mandate.mode != Mode::Autonomous && current.approved_checkpoints.is_empty() {
+                if current.checkpoint.is_none() {
+                    self.engine.checkpoint(ticket, "plan", "plan").unwrap();
+                }
+                self.engine.approve(ticket, None).unwrap();
+            }
+        }
         self.engine
             .report(
                 ticket,
@@ -1240,9 +1250,26 @@ fn refuses_a_question_with_a_result_and_a_report_on_an_ended_ticket() {
 }
 
 #[test]
+fn checkpoint_mode_needs_an_approved_checkpoint_before_ready() {
+    let h = harness();
+    let ticket_id = h.accepted("1");
+    let error = h.report_q(&ticket_id, ReportState::Ready, Question::Keep).unwrap_err();
+    assert_eq!(error.code, ErrorCode::CheckpointRequired);
+    h.engine.checkpoint(&ticket_id, "plan", "the plan").unwrap();
+    h.engine.approve(&ticket_id, None).unwrap();
+    assert_eq!(h.ticket(&ticket_id).approved_checkpoints, vec!["plan".to_string()]);
+    assert_eq!(
+        h.report(&ticket_id, ReportState::Ready, "done").outcome(),
+        Some(TicketOutcome::Completed)
+    );
+}
+
+#[test]
 fn a_ready_report_shows_review_until_the_ticket_ends() {
     let h = harness();
     let ticket_id = h.accepted("1");
+    h.engine.checkpoint(&ticket_id, "plan", "p").unwrap();
+    h.engine.approve(&ticket_id, None).unwrap();
     let ticket = h.report(&ticket_id, ReportState::Ready, "done");
     assert_eq!(ticket_stage(&ticket), TicketStage::Ended);
     assert_eq!(ticket.latest_report().unwrap().state, ReportState::Ready);
@@ -1315,7 +1342,11 @@ fn tells_only_the_live_tickets_a_profile_change_bears_on() {
     assert!(
         matches!(&h.ticket(&live).inputs[0], TicketInput::PolicyChanged { from, to, effect: Some(effect), .. } if from == "v1" && to == "v2" && effect.rules[0].id == "r1")
     );
-    assert!(h.ticket(&ended).inputs.is_empty());
+    assert!(!h
+        .ticket(&ended)
+        .inputs
+        .iter()
+        .any(|i| matches!(i, TicketInput::PolicyChanged { .. })));
     assert!(h.ticket(&untouched).inputs.is_empty());
     assert!(h.event_types().iter().any(|t| t == "policy_changed"));
 }

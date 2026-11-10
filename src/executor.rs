@@ -339,7 +339,23 @@ impl Daemon {
             }
         }
 
-        // The brief: request, notes, mode rules, memory of this project.
+        // The brief: request, notes, mode rules, branch, memory of this project.
+        let branch = if reused {
+            ticket.execution.as_ref().and_then(|e| e.branch.clone())
+        } else {
+            created
+                .pointer("/worktree/branch")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| is_repo.then(|| format!("sa/{}", short_id(&ticket.id))))
+        };
+        ticket.execution = Some(Execution {
+            name: label.clone(),
+            directory: directory.clone(),
+            assignment: String::new(),
+            workspace_id: (!workspace_id.is_empty()).then_some(workspace_id.clone()),
+            branch: branch.clone(),
+        });
         let project_key = self.ticket_project(&ticket);
         let hits = self.store.memory_search(&project_key, &ticket.title, 5).unwrap_or_default();
         let request = self.store.request_get(&ticket.origin.request_id);
@@ -416,6 +432,7 @@ impl Daemon {
             directory,
             assignment: brief_path.display().to_string(),
             workspace_id: (!workspace_id.is_empty()).then_some(workspace_id),
+            branch,
         });
         self.store.ticket_save(&ticket);
         let _ = self.engine.assignment_placed(&ticket.id, &assignment.id, &pane_id);
