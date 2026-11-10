@@ -404,9 +404,15 @@ pub struct Checkpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Execution {
+    /// The ticket's workspace label, as people see it in herdr.
     pub name: String,
+    /// The worktree (or project directory) every role of the ticket works in.
     pub directory: String,
+    /// The path of the latest brief.
     pub assignment: String,
+    /// The herdr workspace that holds the ticket: one per ticket, one tab per assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

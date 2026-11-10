@@ -58,6 +58,7 @@ impl Engine {
                 name,
                 directory: String::new(),
                 assignment: String::new(),
+                workspace_id: None,
             }),
             delivery: None,
         };

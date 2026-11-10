@@ -122,6 +122,12 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ProfileAction>,
     },
+    /// Close the herdr workspaces of ended tickets (their worktrees stay on disk).
+    Tidy {
+        /// Only tickets that ended more than this many hours ago.
+        #[arg(long, default_value_t = 0)]
+        older_than_hours: u64,
+    },
     /// Clear this profile's titles and `sa_*` tokens from herdr panes and workspaces (after a test run).
     Cleanup {
         /// Clear every `sa_*` token herdr still holds, whatever the profile.
@@ -702,6 +708,39 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             out(
                 json!({ "saved": true, "diff": lines, "mode_changes": changes, "from": before.version(), "to": after.version() }),
                 text,
+            )
+        }
+        Command::Tidy { older_than_hours } => {
+            let herdr = crate::herdr::Herdr::from_env().map_err(|e| e.to_string())?;
+            let tickets = daemon("tickets", json!({ "all": true }))?;
+            let open: std::collections::HashSet<String> = herdr
+                .workspace_list()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|w| w.workspace_id)
+                .collect();
+            let cutoff = crate::core::clock::plus_ms(&crate::core::clock::now_iso(), -(older_than_hours as i64) * 3_600_000);
+            let mut closed = Vec::new();
+            for t in tickets.as_array().cloned().unwrap_or_default() {
+                let ended = t["ended"]["at"].as_str().unwrap_or("");
+                let Some(workspace) = t.pointer("/execution/workspace_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if ended.is_empty() || ended > cutoff.as_str() || !open.contains(workspace) {
+                    continue;
+                }
+                herdr
+                    .call("workspace.close", json!({ "workspace_id": workspace }))
+                    .map_err(|e| e.to_string())?;
+                closed.push(format!("{} ({})", t["id"].as_str().unwrap_or(""), workspace));
+            }
+            out(
+                json!({ "closed": closed }),
+                if closed.is_empty() {
+                    "nothing to tidy".to_string()
+                } else {
+                    format!("closed {}", closed.join(", "))
+                },
             )
         }
         Command::Cleanup { all } => {

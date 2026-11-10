@@ -108,9 +108,13 @@ pub fn delivery_text(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::model::*;
+
+    pub(crate) fn sample(mode: Mode) -> Ticket {
+        ticket(mode)
+    }
 
     fn ticket(mode: Mode) -> Ticket {
         Ticket {

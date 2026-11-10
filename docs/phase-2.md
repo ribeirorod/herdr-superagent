@@ -34,6 +34,26 @@ shape mismatches in `agent.list` fields or in the `worktree.create` result;
 `--debug` logs every request and response, so a `debug-bundle` is enough to
 fix them.
 
+## Layout: one workspace per ticket, one tab per assignment
+
+```text
+◆ superagent · work              cockpit · daemon
+Fix the flaky login test · 7fdb40 worker · reviewer · worker #2     ← one worktree, branch sa/7fdb40
+Compare vector stores · d81269    worker
+```
+
+- The first assignment of a ticket creates its workspace: a worktree of the
+  project's repo on branch `sa/<short id>` (herdr groups it under the repo's
+  workspace), else a plain workspace in the project directory. The label is
+  the ticket's title plus its short id.
+- Every later assignment of the same ticket (a retry, a reviewer, a restart)
+  is a new **tab** in that workspace, in the same worktree, labelled by role
+  and numbered when the role ran before.
+- Pane titles follow the stage (`worker · review`, `reviewer · blocked`);
+  agents are named `<profile>-<short id>-<role>`.
+- Ended tickets keep their workspace for reading; `herdr-superagent tidy
+  [--older-than-hours N]` closes them (worktrees stay on disk).
+
 ## Decisions taken while building
 
 - **Polling instead of `events.subscribe`.** One `agent.list` per tick (2 s)

@@ -132,14 +132,64 @@ pub fn pick_tier(profile: &Profile, role: &str) -> (String, String) {
     (profile.superagent.harness.clone(), String::new())
 }
 
-/// A herdr agent name for a worker: `[a-z][a-z0-9_-]{0,31}`.
-pub fn worker_name(ticket_id: &str, n: usize) -> String {
-    let id: String = ticket_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_lowercase();
-    format!("sa-{}-{n}", id.trim_start_matches('t')).chars().take(32).collect()
+/// The short id people see: `t-7fdb40` → `7fdb40`.
+pub fn short_id(ticket_id: &str) -> String {
+    ticket_id.trim_start_matches("t-").to_string()
+}
+
+/// The ticket's workspace label: the title, trimmed, plus the short id.
+pub fn workspace_label(title: &str, ticket_id: &str) -> String {
+    let mut text: String = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > 32 {
+        text = text.chars().take(31).collect::<String>().trim_end().to_string() + "…";
+    }
+    if text.is_empty() {
+        text = "ticket".into();
+    }
+    format!("{text} · {}", short_id(ticket_id))
+}
+
+/// The tab label of an assignment: its role, numbered when the role ran before (`worker #2`).
+pub fn tab_label(ticket: &Ticket, assignment_id: &str) -> String {
+    let role = ticket
+        .assignments
+        .iter()
+        .find(|a| a.id == assignment_id)
+        .map(|a| a.role.as_str())
+        .unwrap_or("worker");
+    let nth = ticket
+        .assignments
+        .iter()
+        .take_while(|a| a.id != assignment_id)
+        .filter(|a| a.role == role)
+        .count()
+        + 1;
+    if nth == 1 {
+        role.to_string()
+    } else {
+        format!("{role} #{nth}")
+    }
+}
+
+/// A herdr agent name for a worker: `<profile>-<short id>-<role>`, fitted to `[a-z][a-z0-9_-]{0,31}`.
+pub fn worker_name(profile: &str, ticket_id: &str, tab: &str) -> String {
+    let clean = |s: &str| {
+        s.to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+    };
+    let mut name = format!("{}-{}-{}", clean(profile), short_id(ticket_id), clean(tab).replace("--", "-"));
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        name = format!("sa-{name}");
+    }
+    name.chars().take(32).collect::<String>().trim_end_matches('-').to_string()
 }
 
 impl Daemon {
@@ -196,9 +246,11 @@ impl Daemon {
         }
         let role = assignment.role.clone();
         let (harness, model) = pick_tier(&profile, &role);
-        let label = format!("{} · {}", ticket.id, role);
+        let label = workspace_label(&ticket.title, &ticket.id);
+        let tab = tab_label(&ticket, &assignment.id);
 
-        // Where the worker lives: a worktree of the project's repo, else a workspace.
+        // Where the worker lives: the ticket's workspace, one tab per assignment (PLAN §8b).
+        // The first assignment creates it: a worktree of the project's repo, else a workspace.
         let project = ticket
             .project
             .as_deref()
@@ -208,15 +260,46 @@ impl Daemon {
             .as_deref()
             .map(|p| std::path::Path::new(p).join(".git").exists())
             .unwrap_or(false);
-        let n = ticket.assignments.len();
-        let created = if is_repo {
-            herdr.call(
-                "worktree.create",
-                json!({ "cwd": project, "branch": format!("sa/{}", ticket.id), "label": label, "focus": false }),
-            )
-        } else {
-            let cwd = project.clone().unwrap_or_else(|| self.paths.profile_dir().display().to_string());
-            herdr.call("workspace.create", json!({ "cwd": cwd, "label": label, "focus": false, "env": { "SUPERAGENT_TICKET": ticket.id, "SUPERAGENT_ROLE": role, "SUPERAGENT_PROFILE": self.paths.profile } }))
+        let existing = ticket.execution.as_ref().and_then(|e| e.workspace_id.clone()).filter(|id| {
+            herdr
+                .workspace_list()
+                .map(|list| list.iter().any(|w| &w.workspace_id == id))
+                .unwrap_or(false)
+        });
+        let env = json!({ "SUPERAGENT_TICKET": ticket.id, "SUPERAGENT_ROLE": role, "SUPERAGENT_PROFILE": self.paths.profile });
+        let (created, reused) = match &existing {
+            Some(workspace_id) => {
+                let cwd = ticket
+                    .execution
+                    .as_ref()
+                    .map(|e| e.directory.clone())
+                    .filter(|d| !d.is_empty())
+                    .or(project.clone());
+                (
+                    herdr.call(
+                        "tab.create",
+                        json!({ "workspace_id": workspace_id, "label": tab, "cwd": cwd, "focus": false, "env": env }),
+                    ),
+                    true,
+                )
+            }
+            None if is_repo => (
+                herdr.call(
+                    "worktree.create",
+                    json!({ "cwd": project, "branch": format!("sa/{}", short_id(&ticket.id)), "label": label, "focus": false }),
+                ),
+                false,
+            ),
+            None => {
+                let cwd = project.clone().unwrap_or_else(|| self.paths.profile_dir().display().to_string());
+                (
+                    herdr.call(
+                        "workspace.create",
+                        json!({ "cwd": cwd, "label": label, "focus": false, "env": env }),
+                    ),
+                    false,
+                )
+            }
         };
         let created = match created {
             Ok(v) => v,
@@ -227,19 +310,33 @@ impl Daemon {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let workspace_id = created
-            .pointer("/workspace/workspace_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let directory = created
-            .pointer("/worktree/path")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or(project.clone())
-            .unwrap_or_default();
+        let workspace_id = if reused {
+            existing.clone().unwrap_or_default()
+        } else {
+            created
+                .pointer("/workspace/workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let directory = if reused {
+            ticket.execution.as_ref().map(|e| e.directory.clone()).unwrap_or_default()
+        } else {
+            created
+                .pointer("/worktree/path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or(project.clone())
+                .unwrap_or_default()
+        };
         if pane_id.is_empty() {
             return Outcome::Fail(format!("no pane in the created place: {created}"));
+        }
+        // The first tab carries the role's name like the later ones.
+        if !reused {
+            if let Some(tab_id) = created.pointer("/tab/tab_id").and_then(Value::as_str) {
+                let _ = herdr.call("tab.rename", json!({ "tab_id": tab_id, "label": tab }));
+            }
         }
 
         // The brief: request, notes, mode rules, memory of this project.
@@ -285,7 +382,7 @@ impl Daemon {
 
         let mut args = crate::calibration::model_args(&harness, &model);
         args.extend(mode_flags(&profile, &harness, ticket.mandate.mode));
-        let name = worker_name(&ticket.id, n);
+        let name = worker_name(&self.paths.profile, &ticket.id, &tab);
         if let Err(e) = herdr.call(
             "agent.start",
             json!({ "name": name, "kind": harness, "pane_id": pane_id, "args": args, "timeout_ms": 60000 }),
@@ -298,21 +395,27 @@ impl Daemon {
         }
         let _ = herdr.report_pane_metadata(
             &pane_id,
-            Some(&format!("{} · {} · working", ticket.id, role)),
+            Some(&format!("{tab} · working")),
             &[
-                ("sa_task", &format!("{} · {}", ticket.id, role)),
+                ("sa_task", label.as_str()),
                 ("sa_stage", "working"),
-                ("sa_ticket", &ticket.id),
+                ("sa_ticket", ticket.id.as_str()),
+                ("sa_profile", self.paths.profile.as_str()),
             ],
         );
-        if !workspace_id.is_empty() {
-            let _ = herdr.report_workspace_metadata(&workspace_id, &[("sa_ticket", &ticket.id)], crate::herdr::seq_now());
+        if !workspace_id.is_empty() && !reused {
+            let _ = herdr.report_workspace_metadata(
+                &workspace_id,
+                &[("sa_ticket", &ticket.id), ("sa_profile", &self.paths.profile)],
+                crate::herdr::seq_now(),
+            );
         }
 
         ticket.execution = Some(Execution {
             name: label,
             directory,
             assignment: brief_path.display().to_string(),
+            workspace_id: (!workspace_id.is_empty()).then_some(workspace_id),
         });
         self.store.ticket_save(&ticket);
         let _ = self.engine.assignment_placed(&ticket.id, &assignment.id, &pane_id);
@@ -401,7 +504,8 @@ impl Daemon {
         };
         if let Some(herdr) = &self.herdr {
             // The pane stays, so the conversation can be read; its title says it is over.
-            let _ = herdr.report_pane_metadata(&pane, Some(&format!("{} · {reason}", ticket.id)), &[("sa_stage", "ended")]);
+            let tab = tab_label(&ticket, assignment_id);
+            let _ = herdr.report_pane_metadata(&pane, Some(&format!("{tab} · {reason}")), &[("sa_stage", "ended")]);
         }
         self.workers.borrow_mut().remove(&pane);
         Outcome::Done
@@ -554,7 +658,11 @@ impl Daemon {
             // The pane title follows the stage.
             if let Some(fresh) = self.store.ticket_get(&ticket.id) {
                 let stage = ticket_stage(&fresh).label();
-                let title = format!("{} · {} · {}", fresh.id, assignment.role, stage);
+                let title = format!(
+                    "{} · {}",
+                    tab_label(&fresh, &assignment.id),
+                    stage.split('/').next_back().unwrap_or(&stage)
+                );
                 let mut workers = self.workers.borrow_mut();
                 if let Some(seen) = workers.get_mut(&pane_id) {
                     if seen.title != title {
@@ -669,6 +777,60 @@ mod tests {
             vec!["--dangerously-skip-permissions"]
         );
         assert!(mode_flags(&profile, "claude", Mode::Checkpoint).is_empty());
-        assert_eq!(worker_name("t-abc123", 1), "sa-abc123-1");
+        assert_eq!(worker_name("work", "t-abc123", "worker"), "work-abc123-worker");
+        assert_eq!(worker_name("9side", "t-abc123", "worker #2"), "sa-9side-abc123-worker-2");
+        assert_eq!(
+            workspace_label("Fix the flaky login test", "t-abc123"),
+            "Fix the flaky login test · abc123"
+        );
+        assert!(workspace_label(&"x".repeat(60), "t-1").starts_with(&"x".repeat(31)));
+        let mut ticket = crate::brief::tests::sample(Mode::Checkpoint);
+        ticket.assignments = vec![
+            Assignment {
+                id: "a1".into(),
+                role: "worker".into(),
+                state: AssignmentState::Ended,
+                created_at: "t".into(),
+                started_at: None,
+                ended_at: None,
+                ended_reason: None,
+                report: None,
+                delivered_at: None,
+                idle_at: None,
+                pane_id: None,
+                parent: None,
+            },
+            Assignment {
+                id: "a2".into(),
+                role: "reviewer".into(),
+                state: AssignmentState::Running,
+                created_at: "t".into(),
+                started_at: None,
+                ended_at: None,
+                ended_reason: None,
+                report: None,
+                delivered_at: None,
+                idle_at: None,
+                pane_id: None,
+                parent: None,
+            },
+            Assignment {
+                id: "a3".into(),
+                role: "worker".into(),
+                state: AssignmentState::Pending,
+                created_at: "t".into(),
+                started_at: None,
+                ended_at: None,
+                ended_reason: None,
+                report: None,
+                delivered_at: None,
+                idle_at: None,
+                pane_id: None,
+                parent: None,
+            },
+        ];
+        assert_eq!(tab_label(&ticket, "a1"), "worker");
+        assert_eq!(tab_label(&ticket, "a2"), "reviewer");
+        assert_eq!(tab_label(&ticket, "a3"), "worker #2");
     }
 }
