@@ -6,8 +6,10 @@ and lets you review at checkpoints. Harness-agnostic (Claude Code, Codex and
 Pi first), model-agnostic, one profile per context (work, personal, …).
 
 The design is in [docs/PLAN.md](docs/PLAN.md). This repository is at
-**phase 2**: the engine, the daemon, profiles with calibration, the state
-repo with its lease, and the executor that runs workers in herdr panes. See
+**phase 3**: the engine, the daemon, profiles with calibration, the state
+repo with its lease, the executor that runs workers in herdr panes, and
+delegation (workers spawn reviewers and builders in sibling tabs, guard shims
+in autonomous mode). See
 `docs/phase-*.md` for what works today and what is next.
 
 ## Install

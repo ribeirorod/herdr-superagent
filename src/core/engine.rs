@@ -24,6 +24,8 @@ pub struct WorkerReport {
     pub state: ReportState,
     pub summary: String,
     pub question: Question,
+    /// The assignment that reports; `None` means the ticket's running root assignment.
+    pub assignment_id: Option<String>,
 }
 
 /// A worker's question for a person: asked, kept, or cleared.
@@ -178,7 +180,25 @@ impl Engine {
 
     /// A worker stops at a declared milestone and waits for review.
     pub fn checkpoint(&self, ticket_id: &str, name: &str, summary: &str) -> Result<Ticket, UserError> {
-        self.atomic(|| self.checkpoint_inner(ticket_id, name, summary))
+        self.atomic(|| self.checkpoint_inner(ticket_id, name, summary, None))
+    }
+
+    /// `checkpoint` for a named assignment (a child's checkpoint also waits for review).
+    pub fn checkpoint_as(&self, ticket_id: &str, assignment_id: &str, name: &str, summary: &str) -> Result<Ticket, UserError> {
+        self.atomic(|| self.checkpoint_inner(ticket_id, name, summary, Some(assignment_id)))
+    }
+
+    /// A worker spawns a child assignment (a reviewer, a builder) under its ticket, in the
+    /// same mode or a stricter one.
+    pub fn spawn(
+        &self,
+        ticket_id: &str,
+        parent_assignment_id: &str,
+        role: &str,
+        task: &str,
+        mode: Option<Mode>,
+    ) -> Result<Assignment, UserError> {
+        self.atomic(|| self.spawn_inner(ticket_id, parent_assignment_id, role, task, mode))
     }
 
     // ---- The executor ----

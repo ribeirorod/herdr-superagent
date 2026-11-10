@@ -265,8 +265,8 @@ impl Daemon {
         self.store
             .ticket_open()
             .iter()
-            .filter(|t| t.running_assignment().map(|a| a.pane_id.is_some()).unwrap_or(false))
-            .count()
+            .map(|t| t.running_assignments().filter(|a| a.pane_id.is_some()).count())
+            .sum()
     }
 
     /// The memory project of a ticket: its repository's slug, else the notes bucket.
@@ -302,6 +302,7 @@ impl Daemon {
                     state: ReportState::Failed,
                     summary: format!("could not launch a worker: {}", effect.error),
                     question: Question::Keep,
+                    assignment_id: None,
                 },
             );
             return Outcome::Done;
@@ -432,7 +433,7 @@ impl Daemon {
         let project_key = self.ticket_project(&ticket);
         let hits = self.store.memory_search(&project_key, &ticket.title, 5).unwrap_or_default();
         let request = self.store.request_get(&ticket.origin.request_id);
-        let text = brief::render(&self.paths.profile, &ticket, request.as_ref(), &role, &hits);
+        let text = brief::render(&self.paths.profile, &ticket, request.as_ref(), &assignment, &hits);
         let brief_path =
             self.paths
                 .state_dir()
@@ -445,12 +446,23 @@ impl Daemon {
             return Outcome::Fail(format!("write brief: {e}"));
         }
 
+        let effective_mode = assignment.mode.unwrap_or(ticket.mandate.mode);
+        // Autonomous workers get the guard shims first on PATH (PLAN §6).
+        let mut worker_path = crate::envpath::full_path();
+        if effective_mode == Mode::Autonomous {
+            match crate::guard::write_shims(&self.paths.state_dir().join("shims"), &crate::envpath::self_path()) {
+                Ok(dir) => worker_path = format!("{}:{worker_path}", dir.display()),
+                Err(e) => tracing::warn!(%e, "could not write guard shims"),
+            }
+        }
         // The worker's environment, through its shell, since agent.start takes none.
         let mut exports = vec![
             format!("SUPERAGENT_TICKET={}", ticket.id),
             format!("SUPERAGENT_ROLE={role}"),
+            format!("SUPERAGENT_ASSIGNMENT={}", assignment.id),
             format!("SUPERAGENT_PROFILE={}", self.paths.profile),
-            format!("PATH={}", crate::envpath::full_path()),
+            format!("PATH={worker_path}"),
+            format!("SUPERAGENT_WORKTREE={directory}"),
         ];
         for key in [
             "HERDR_SUPERAGENT_STATE_DIR",
@@ -470,7 +482,7 @@ impl Daemon {
         std::thread::sleep(Duration::from_millis(300));
 
         let mut args = crate::calibration::model_args(&harness, &model);
-        args.extend(mode_flags(&profile, &harness, ticket.mandate.mode));
+        args.extend(mode_flags(&profile, &harness, effective_mode));
         let name = worker_name(&self.paths.profile, &ticket.id, &tab);
         if let Err(e) = herdr.call(
             "agent.start",
@@ -609,7 +621,15 @@ impl Daemon {
             .store
             .ticket_open()
             .into_iter()
-            .filter_map(|t| t.running_assignment().filter(|a| a.pane_id.is_some()).cloned().map(|a| (t, a)))
+            .flat_map(|t| {
+                let pairs: Vec<(Ticket, Assignment)> = t
+                    .running_assignments()
+                    .filter(|a| a.pane_id.is_some())
+                    .cloned()
+                    .map(|a| (t.clone(), a))
+                    .collect();
+                pairs
+            })
             .collect();
         if running.is_empty() {
             return;
@@ -647,6 +667,7 @@ impl Daemon {
                         state: ReportState::Failed,
                         summary: "the worker's pane was closed".into(),
                         question: Question::Keep,
+                        assignment_id: None,
                     },
                 );
                 self.workers.borrow_mut().remove(&pane_id);
@@ -696,6 +717,7 @@ impl Daemon {
                                 state: ReportState::Blocked,
                                 summary: "the harness is waiting for you (permission or question dialog)".into(),
                                 question: Question::Keep,
+                                assignment_id: None,
                             },
                         )
                         .map(|_| ()),
@@ -707,6 +729,7 @@ impl Daemon {
                                 state: ReportState::Progress,
                                 summary,
                                 question: Question::Keep,
+                                assignment_id: None,
                             },
                         )
                         .map(|_| ()),
@@ -724,6 +747,7 @@ impl Daemon {
                                     state: ReportState::Waiting,
                                     summary,
                                     question: Question::Keep,
+                                    assignment_id: None,
                                 },
                             )
                             .and_then(|_| self.engine.request_status(&ticket.id))
@@ -737,6 +761,7 @@ impl Daemon {
                                 state: ReportState::Failed,
                                 summary,
                                 question: Question::Keep,
+                                assignment_id: None,
                             },
                         )
                         .map(|_| ()),
@@ -933,6 +958,8 @@ mod tests {
                 idle_at: None,
                 pane_id: None,
                 parent: None,
+                task: None,
+                mode: None,
             },
             Assignment {
                 id: "a2".into(),
@@ -947,6 +974,8 @@ mod tests {
                 idle_at: None,
                 pane_id: None,
                 parent: None,
+                task: None,
+                mode: None,
             },
             Assignment {
                 id: "a3".into(),
@@ -961,6 +990,8 @@ mod tests {
                 idle_at: None,
                 pane_id: None,
                 parent: None,
+                task: None,
+                mode: None,
             },
         ];
         assert_eq!(tab_label(&ticket, "a1"), "worker");

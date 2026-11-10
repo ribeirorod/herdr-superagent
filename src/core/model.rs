@@ -269,6 +269,18 @@ pub struct Assignment {
     /// The assignment that spawned this one, for children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// What the parent asked a child to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// A child's mode, never more autonomous than the ticket's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+}
+
+impl Assignment {
+    pub fn is_root(&self) -> bool {
+        self.parent.is_none()
+    }
 }
 
 fn default_role() -> String {
@@ -470,14 +482,27 @@ impl Ticket {
     pub fn outcome(&self) -> Option<TicketOutcome> {
         self.ended.as_ref().map(|ended| ended.outcome)
     }
+    /// The root assignment that runs the ticket (children run beside it).
     pub fn running_assignment(&self) -> Option<&Assignment> {
-        self.assignments.iter().find(|a| a.state == AssignmentState::Running)
+        self.assignments.iter().find(|a| a.state == AssignmentState::Running && a.is_root())
     }
-    pub fn running_assignment_mut(&mut self) -> Option<&mut Assignment> {
-        self.assignments.iter_mut().find(|a| a.state == AssignmentState::Running)
+    /// Every running assignment, root and children.
+    pub fn running_assignments(&self) -> impl Iterator<Item = &Assignment> {
+        self.assignments.iter().filter(|a| a.state == AssignmentState::Running)
     }
+    pub fn assignment_mut(&mut self, id: &str) -> Option<&mut Assignment> {
+        self.assignments.iter_mut().find(|a| a.id == id)
+    }
+    /// The latest root assignment: the ticket's own run, not a child's.
     pub fn latest_assignment(&self) -> Option<&Assignment> {
-        self.assignments.last()
+        self.assignments.iter().rev().find(|a| a.is_root())
+    }
+    /// The children of an assignment that still run.
+    pub fn running_children(&self, parent: &str) -> Vec<&Assignment> {
+        self.assignments
+            .iter()
+            .filter(|a| a.state == AssignmentState::Running && a.parent.as_deref() == Some(parent))
+            .collect()
     }
     /// The latest report any assignment made: what the ticket last said.
     pub fn latest_report(&self) -> Option<&Report> {

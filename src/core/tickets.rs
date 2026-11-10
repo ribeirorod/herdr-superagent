@@ -94,6 +94,8 @@ impl Engine {
             idle_at: None,
             pane_id: None,
             parent,
+            task: None,
+            mode: None,
         };
         ticket.assignments.push(assignment.clone());
         assignment
@@ -405,7 +407,13 @@ impl Engine {
         Ok(true)
     }
 
-    pub(crate) fn checkpoint_inner(&self, ticket_id: &str, name: &str, summary: &str) -> Result<Ticket, UserError> {
+    pub(crate) fn checkpoint_inner(
+        &self,
+        ticket_id: &str,
+        name: &str,
+        summary: &str,
+        assignment_id: Option<&str>,
+    ) -> Result<Ticket, UserError> {
         let mut ticket = self.require_ticket(ticket_id)?;
         if !ticket.live() {
             return Err(UserError::new(ErrorCode::TicketEnded));
@@ -414,12 +422,18 @@ impl Engine {
             return Err(UserError::new(ErrorCode::CheckpointOpen).with("checkpoint", &open.name));
         }
         let at = self.now();
-        let assignment = ticket
-            .assignments
-            .iter_mut()
-            .rev()
-            .find(|a| a.state != AssignmentState::Ended)
-            .ok_or_else(|| UserError::new(ErrorCode::AssignmentEnded))?;
+        let assignment = match assignment_id {
+            Some(id) => ticket
+                .assignments
+                .iter_mut()
+                .find(|a| a.id == id && a.state != AssignmentState::Ended),
+            None => ticket
+                .assignments
+                .iter_mut()
+                .rev()
+                .find(|a| a.state != AssignmentState::Ended && a.is_root()),
+        }
+        .ok_or_else(|| UserError::new(ErrorCode::AssignmentEnded))?;
         // The worker's turn ends here: the assignment is settled until a person approves.
         assignment.report = Some(Report {
             state: ReportState::Waiting,
@@ -467,6 +481,41 @@ impl Engine {
             name: checkpoint.name,
         });
         self.require_ticket(ticket_id)
+    }
+
+    pub(crate) fn spawn_inner(
+        &self,
+        ticket_id: &str,
+        parent_id: &str,
+        role: &str,
+        task: &str,
+        mode: Option<Mode>,
+    ) -> Result<Assignment, UserError> {
+        let mut ticket = self.require_ticket(ticket_id)?;
+        if !ticket.live() {
+            return Err(UserError::new(ErrorCode::TicketEnded));
+        }
+        let parent = ticket
+            .assignments
+            .iter()
+            .find(|a| a.id == parent_id)
+            .ok_or_else(|| UserError::new(ErrorCode::UnknownAssignment))?;
+        if parent.state == AssignmentState::Ended {
+            return Err(UserError::new(ErrorCode::AssignmentEnded));
+        }
+        let parent_mode = parent.mode.unwrap_or(ticket.mandate.mode);
+        let mut child = self.new_assignment(&mut ticket, role, Some(parent_id.to_string()));
+        child.task = Some(task.to_string());
+        // A child never runs more autonomously than its parent.
+        child.mode = Some(mode.map(|m| m.stricter(parent_mode)).unwrap_or(parent_mode));
+        if let Some(stored) = ticket.assignment_mut(&child.id) {
+            stored.task = child.task.clone();
+            stored.mode = child.mode;
+        }
+        ticket.updated_at = self.now();
+        self.repo().ticket_save(&ticket);
+        self.executor().start(&ticket, &child);
+        Ok(child)
     }
 
     pub(crate) fn policy_changed_inner(&self, from: &str, to: &str, effects: &HashMap<String, PolicyEffect>) -> Result<(), UserError> {

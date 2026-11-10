@@ -256,6 +256,7 @@ impl Harness {
                     state,
                     summary: summary.into(),
                     question: Question::Keep,
+                    assignment_id: None,
                 },
             )
             .unwrap()
@@ -267,6 +268,7 @@ impl Harness {
                 state,
                 summary: "x".into(),
                 question,
+                assignment_id: None,
             },
         )
     }
@@ -1449,6 +1451,7 @@ fn a_failed_transaction_leaves_nothing_behind() {
                 state: ReportState::Ready,
                 summary: "x".into(),
                 question: Question::Ask("Q?".into()),
+                assignment_id: None,
             },
         )
         .unwrap_err();
@@ -1490,4 +1493,78 @@ fn stages_follow_the_table_in_order() {
     });
     assert_eq!(ticket_stage(&ticket).label(), "person/delivery");
     assert!(ticket_stage(&ticket).needs_person());
+}
+
+// ---- delegation (phase 3) ----
+
+#[test]
+fn a_spawned_child_runs_beside_its_parent_and_its_final_report_tells_the_parent() {
+    let h = harness();
+    let ticket_id = h.accepted("1");
+    let root = h.running(&ticket_id).id;
+    let child = h
+        .engine
+        .spawn(&ticket_id, &root, "reviewer", "Review the diff", Some(Mode::Autonomous))
+        .unwrap();
+    assert_eq!(child.parent.as_deref(), Some(root.as_str()));
+    assert_eq!(
+        child.mode,
+        Some(Mode::Checkpoint),
+        "a child is never more autonomous than its parent"
+    );
+    assert_eq!(child.task.as_deref(), Some("Review the diff"));
+    assert_eq!(h.recorder.launches.borrow().last().unwrap().1, child.id);
+    h.settle();
+    let ticket = h.ticket(&ticket_id);
+    assert_eq!(ticket.running_assignments().count(), 2);
+    assert_eq!(ticket.running_assignment().unwrap().id, root, "the root still runs the ticket");
+    // The child's ready report does not end the ticket; it ends the child and reaches the parent.
+    h.engine
+        .report(
+            &ticket_id,
+            WorkerReport {
+                state: ReportState::Ready,
+                summary: "LGTM, two nits".into(),
+                question: Question::Keep,
+                assignment_id: Some(child.id.clone()),
+            },
+        )
+        .unwrap();
+    let ticket = h.ticket(&ticket_id);
+    assert!(ticket.live());
+    let stored = ticket.assignments.iter().find(|a| a.id == child.id).unwrap();
+    assert_eq!(
+        (stored.state, stored.ended_reason.as_deref()),
+        (AssignmentState::Ended, Some("ready"))
+    );
+    assert!(ticket
+        .undelivered
+        .iter()
+        .any(|id| matches!(ticket.input(id), Some(TicketInput::Text { text, .. }) if text.contains("reviewer") && text.contains("LGTM"))));
+    assert_eq!(ticket_stage(&ticket), TicketStage::Working { queued: false });
+    assert_eq!(h.recorder.stops.borrow().last().unwrap().1, child.id);
+    // Spawning under an ended assignment or an ended ticket is refused.
+    assert_eq!(
+        h.engine.spawn(&ticket_id, &child.id, "x", "y", None).unwrap_err().code,
+        ErrorCode::AssignmentEnded
+    );
+    h.engine.stop_ticket(&ticket_id, None).unwrap();
+    assert_eq!(
+        h.engine.spawn(&ticket_id, &root, "x", "y", None).unwrap_err().code,
+        ErrorCode::TicketEnded
+    );
+}
+
+#[test]
+fn a_root_ready_report_ends_a_ticket_with_a_running_child_too() {
+    let h = harness();
+    let ticket_id = h.accepted("1");
+    let root = h.running(&ticket_id).id;
+    let child = h.engine.spawn(&ticket_id, &root, "reviewer", "Review", None).unwrap();
+    h.settle();
+    h.report(&ticket_id, ReportState::Ready, "done");
+    let ticket = h.ticket(&ticket_id);
+    assert_eq!(ticket.outcome(), Some(TicketOutcome::Completed));
+    assert!(ticket.assignments.iter().all(|a| a.state == AssignmentState::Ended));
+    assert!(h.recorder.stops.borrow().iter().any(|(_, a, _)| a == &child.id));
 }

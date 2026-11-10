@@ -91,6 +91,40 @@ pub enum Command {
     Ticket { ticket: String },
     /// Worker: report the ticket's status.
     Report(ReportArgs),
+    /// Worker: spawn a child (reviewer, builder, researcher) in a sibling tab of this ticket.
+    Spawn {
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        task: String,
+        /// propose, checkpoint or autonomous; never more autonomous than yours.
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long, env = "SUPERAGENT_TICKET")]
+        ticket: String,
+        #[arg(long, env = "SUPERAGENT_ASSIGNMENT")]
+        parent: Option<String>,
+    },
+    /// Worker: wait for a child assignment's final report.
+    Watch {
+        assignment: String,
+        #[arg(long, env = "SUPERAGENT_TICKET")]
+        ticket: String,
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Guard shim target: hold a risky action back as a checkpoint in autonomous mode.
+    #[command(hide = true)]
+    Guard {
+        tool: String,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// The sidebar Agents view for this profile: `view set`, `view clear`, `view snippet`.
+    View {
+        #[command(subcommand)]
+        action: ViewAction,
+    },
     /// Worker: stop at a milestone and wait for review.
     Checkpoint {
         name: String,
@@ -98,6 +132,8 @@ pub enum Command {
         summary: String,
         #[arg(long, env = "SUPERAGENT_TICKET")]
         ticket: String,
+        #[arg(long, env = "SUPERAGENT_ASSIGNMENT")]
+        assignment: Option<String>,
     },
     /// Approve the checkpoint a ticket waits at.
     Approve {
@@ -150,6 +186,16 @@ pub struct StartArgs {
     /// Break another machine's lease on this profile's state repo.
     #[arg(long)]
     pub take_over: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ViewAction {
+    /// Show only this profile's superagent and workers, plus anything blocked, sorted by attention.
+    Set,
+    /// Restore herdr's normal Agents view.
+    Clear,
+    /// Print the herdr config snippet that styles the `$sa_*` tokens in the sidebar.
+    Snippet,
 }
 
 #[derive(Subcommand, Debug)]
@@ -256,6 +302,9 @@ pub struct ReportArgs {
     pub question: Option<String>,
     #[arg(long, env = "SUPERAGENT_TICKET")]
     pub ticket: String,
+    /// The assignment that reports (set for children).
+    #[arg(long, env = "SUPERAGENT_ASSIGNMENT")]
+    pub assignment: Option<String>,
 }
 
 pub fn run(cli: Cli) -> Result<i32, String> {
@@ -563,14 +612,133 @@ pub fn run(cli: Cli) -> Result<i32, String> {
         Command::Report(args) => {
             let value = daemon(
                 "report",
-                json!({ "ticket": args.ticket, "state": args.state, "summary": args.summary, "question": args.question }),
+                json!({ "ticket": args.ticket, "state": args.state, "summary": args.summary, "question": args.question, "assignment": args.assignment }),
             )?;
             out(value.clone(), ticket_line(&value))
         }
-        Command::Checkpoint { name, summary, ticket } => {
-            let value = daemon("checkpoint", json!({ "ticket": ticket, "name": name, "summary": summary }))?;
+        Command::Checkpoint {
+            name,
+            summary,
+            ticket,
+            assignment,
+        } => {
+            let value = daemon(
+                "checkpoint",
+                json!({ "ticket": ticket, "name": name, "summary": summary, "assignment": assignment }),
+            )?;
             let line = format!("{}\nStop here: end your turn and wait for approval.", ticket_line(&value));
             out(value, line)
+        }
+        Command::Spawn {
+            role,
+            task,
+            mode,
+            ticket,
+            parent,
+        } => {
+            let child = daemon(
+                "spawn",
+                json!({ "ticket": ticket, "role": role, "task": task, "mode": mode, "parent": parent }),
+            )?;
+            let id = child["id"].as_str().unwrap_or("").to_string();
+            out(
+                child.clone(),
+                format!(
+                    "spawned {role} {id} (mode {}); it opens in a new tab of this ticket's workspace. Wait with: herdr-superagent watch {id}",
+                    child["mode"].as_str().unwrap_or("")
+                ),
+            )
+        }
+        Command::Watch {
+            assignment,
+            ticket,
+            timeout,
+        } => {
+            let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
+            loop {
+                let value = daemon("ticket", json!({ "ticket": ticket }))?;
+                let found = value["assignments"]
+                    .as_array()
+                    .and_then(|a| {
+                        a.iter()
+                            .find(|x| x["id"].as_str().map(|id| id.starts_with(assignment.as_str())).unwrap_or(false))
+                    })
+                    .cloned();
+                let Some(found) = found else {
+                    return Err(format!("no assignment {assignment} on ticket {ticket}"));
+                };
+                let state = found["report"]["state"].as_str().unwrap_or("");
+                let ended = found["state"] == "ended";
+                if ended || matches!(state, "ready" | "failed" | "dropped" | "blocked") || value["stage"] == "ended" {
+                    let text = format!(
+                        "{} {} · {}: {}",
+                        found["role"].as_str().unwrap_or(""),
+                        found["id"].as_str().unwrap_or("").chars().take(8).collect::<String>(),
+                        if ended {
+                            found["ended_reason"].as_str().unwrap_or("ended")
+                        } else {
+                            state
+                        },
+                        found["report"]["summary"].as_str().unwrap_or("")
+                    );
+                    return out(found, text);
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(format!(
+                        "watch timed out after {timeout}s; the child is still {}",
+                        if state.is_empty() { "running" } else { state }
+                    ));
+                }
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+        Command::Guard { tool, args } => guard(&paths, &tool, &args),
+        Command::View { action } => {
+            let herdr = crate::herdr::Herdr::from_env().map_err(|e| e.to_string())?;
+            let source = format!(
+                "plugin:{}",
+                std::env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| "ribeirorod.superagent".into())
+            );
+            match action {
+                ViewAction::Set => {
+                    let params = json!({
+                        "source": source,
+                        "label": format!("superagent · {profile}"),
+                        "filter": { "op": "any", "filters": [
+                            { "op": "eq", "field": { "token": "sa_profile" }, "value": profile },
+                            { "op": "in", "field": "status", "values": ["blocked"] }
+                        ] },
+                        "sort": [ { "field": "attention", "order": "desc" }, { "field": { "token": "sa_stage" }, "order": "asc" }, { "field": "state_change_seq", "order": "desc" } ]
+                    });
+                    let value = match herdr.call("agent.view.set", params.clone()) {
+                        Ok(v) => v,
+                        // Outside a linked plugin herdr refuses plugin sources; fall back to a plain one.
+                        Err(_) => {
+                            let mut plain = params;
+                            plain["source"] = json!("superagent");
+                            herdr.call("agent.view.set", plain).map_err(|e| e.to_string())?
+                        }
+                    };
+                    out(
+                        value,
+                        format!("sidebar shows profile {profile}'s agents and anything blocked; `view clear` restores the normal list"),
+                    )
+                }
+                ViewAction::Clear => {
+                    let value = herdr.call("agent.view.clear", json!({})).map_err(|e| e.to_string())?;
+                    out(value, "normal Agents view restored".into())
+                }
+                ViewAction::Snippet => {
+                    let snippet = r##"# ~/.config/herdr/config.toml: purple superagent rows; worker rows show ticket and stage
+[ui.sidebar.agents]
+layout = [
+  ["state_icon", { token = "$sa_role", fg = "#a855f7", bold = true, rules = [{ equals = "superagent", fg = "#a855f7", bold = true }, { equals = "daemon", hide = true }, { equals = "dashboard", hide = true }] }, "agent"],
+  [{ token = "$sa_task", dim = true }, { token = "$sa_stage", rules = [{ starts_with = "person", fg = "#fbbf24", bold = true }, { equals = "working", fg = "#4ade80" }] }],
+]
+"##;
+                    out(json!({ "snippet": snippet }), snippet.to_string())
+                }
+            }
         }
         Command::Approve { ticket, comment } => {
             let value = daemon("approve", json!({ "ticket": ticket, "comment": comment }))?;
@@ -821,6 +989,36 @@ fn action(profile: &str, paths: &Paths) -> Result<i32, String> {
         }
         other => Err(format!("unknown action '{other}'")),
     }
+}
+
+/// The guard shim: run the real tool, or hold the action back as a checkpoint.
+fn guard(paths: &Paths, tool: &str, args: &[String]) -> Result<i32, String> {
+    use std::os::unix::process::CommandExt;
+    let shims = paths.state_dir().join("shims");
+    let real = crate::guard::real_tool(tool, &shims).ok_or_else(|| format!("guard: {tool} not found on PATH"))?;
+    let ticket = std::env::var("SUPERAGENT_TICKET").ok().filter(|t| !t.is_empty());
+    let worktree = std::env::var("SUPERAGENT_WORKTREE")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .map(std::path::PathBuf::from);
+    let default = crate::guard::default_branch(worktree.as_deref());
+    if let (Some(ticket), Some(reason)) = (&ticket, crate::guard::risk(tool, args, worktree.as_deref(), Some(&default))) {
+        let command = format!("{tool} {}", args.join(" "));
+        let summary = format!("guard held back `{command}`: {reason}. Approve to let the worker run it.");
+        let result = ipc::call(
+            &paths.socket_path(),
+            "checkpoint",
+            json!({ "ticket": ticket, "name": format!("guard-{tool}"), "summary": summary, "assignment": std::env::var("SUPERAGENT_ASSIGNMENT").ok() }),
+            Duration::from_secs(10),
+        );
+        match result {
+            Ok(_) => eprintln!("superagent guard: `{command}` held back ({reason}). A checkpoint was recorded: end your turn and wait for approval, then run the command again."),
+            Err(e) => eprintln!("superagent guard: `{command}` held back ({reason}); could not record a checkpoint: {e}. Report blocked and end your turn."),
+        }
+        return Ok(75);
+    }
+    let error = std::process::Command::new(real).args(args).exec();
+    Err(format!("guard: exec {tool}: {error}"))
 }
 
 /// Collects everything needed to debug a session into one tar.gz.

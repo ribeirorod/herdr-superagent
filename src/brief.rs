@@ -1,6 +1,6 @@
 //! The worker brief: what a worker pane reads first (PLAN §8).
 
-use crate::core::model::{Mode, Request, Ticket, TicketInput};
+use crate::core::model::{Assignment, Mode, Request, Ticket, TicketInput};
 use crate::memory::MemoryHit;
 
 pub const WORKER_TEMPLATE: &str = include_str!("../skills/superagent/worker.md");
@@ -23,7 +23,16 @@ pub fn branch_rules(ticket: &Ticket) -> String {
     }
 }
 
-pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, role: &str, hits: &[MemoryHit]) -> String {
+pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, assignment: &Assignment, hits: &[MemoryHit]) -> String {
+    let role = assignment.role.as_str();
+    let mode = assignment.mode.unwrap_or(ticket.mandate.mode);
+    let task = match &assignment.task {
+        Some(task) => format!(
+            "## Your task from the parent\n\nYou are a child of assignment `{}`. Do only this, then `report --state ready` (your report ends your assignment, not the ticket, and reaches the parent):\n\n{task}\n",
+            assignment.parent.as_deref().map(|p| &p[..8.min(p.len())]).unwrap_or("?")
+        ),
+        None => String::new(),
+    };
     let request_text = request.map(|r| r.text.clone()).unwrap_or_else(|| ticket.title.clone());
     let notes: Vec<String> = ticket
         .inputs
@@ -63,10 +72,12 @@ pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, role: &
         .replace("{role}", role)
         .replace("{profile}", profile)
         .replace("{title}", &ticket.title)
-        .replace("{mode}", ticket.mandate.mode.as_str())
+        .replace("{mode}", mode.as_str())
+        .replace("{task}", &task)
+        .replace("{assignment}", &assignment.id)
         .replace("{workflow}", ticket.workflow.as_deref().unwrap_or("general"))
         .replace("{project}", ticket.project.as_deref().unwrap_or("none (no repository)"))
-        .replace("{mode_rules}", mode_rules(ticket.mandate.mode))
+        .replace("{mode_rules}", mode_rules(mode))
         .replace("{request}", &request_text)
         .replace("{branch}", &branch_rules(ticket))
         .replace("{notes}", &notes)
@@ -171,12 +182,38 @@ pub(crate) mod tests {
             snippet: "race in [login] cache".into(),
             created_at: "t".into(),
         }];
-        let text = render("work", &ticket(Mode::Propose), None, "worker", &hits);
+        let worker = Assignment {
+            id: "a1".into(),
+            role: "worker".into(),
+            state: AssignmentState::Running,
+            created_at: "t".into(),
+            started_at: None,
+            ended_at: None,
+            ended_reason: None,
+            report: None,
+            delivered_at: None,
+            idle_at: None,
+            pane_id: None,
+            parent: None,
+            task: None,
+            mode: None,
+        };
+        let text = render("work", &ticket(Mode::Propose), None, &worker, &hits);
         assert!(text.contains("# Worker brief · ticket t-abc123 · worker"));
         assert!(text.contains("Propose mode: plan only"));
         assert!(text.contains("note from the superagent: tests live in tests/login"));
         assert!(text.contains("t-old worker: login cache"));
         assert!(text.contains("SUPERAGENT_TICKET"));
+        let child = Assignment {
+            id: "a2".into(),
+            role: "reviewer".into(),
+            parent: Some("a1".into()),
+            task: Some("Review the diff".into()),
+            mode: Some(Mode::Autonomous),
+            ..worker.clone()
+        };
+        let text = render("work", &ticket(Mode::Checkpoint), None, &child, &[]);
+        assert!(text.contains("Your task from the parent") && text.contains("Review the diff") && text.contains("Autonomous mode"));
         let (delivery, ids) = delivery_text(&ticket(Mode::Checkpoint), &|_| None, Some(std::path::Path::new("/b/brief.md")));
         assert!(delivery.starts_with("Read /b/brief.md and start on ticket t-abc123."));
         assert!(delivery.contains("Context from the superagent"));

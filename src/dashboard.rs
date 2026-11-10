@@ -116,6 +116,15 @@ fn render(profile: &str, paths: &Paths) -> String {
                 .and_then(Value::as_str)
                 .map(|c| format!(" ⏸ {c}"))
                 .unwrap_or_default();
+            let agents = t["assignments"]
+                .as_array()
+                .map(|a| a.iter().filter(|x| x["state"] == "running").count())
+                .unwrap_or(0);
+            let crew = if agents > 1 {
+                format!(" · {agents} agents")
+            } else {
+                String::new()
+            };
             let branch = t
                 .pointer("/execution/branch")
                 .and_then(Value::as_str)
@@ -128,7 +137,7 @@ fn render(profile: &str, paths: &Paths) -> String {
                 format!("{DIM}  {report}{RESET}")
             };
             lines.push(format!(
-                "  {} {:<9} {:<11} {:<6} {}{}{}{}{}",
+                "  {} {:<9} {:<11} {:<6} {}{}{}{}{}{}",
                 t["id"].as_str().unwrap_or(""),
                 t["stage"].as_str().unwrap_or("").split('/').next_back().unwrap_or(""),
                 t["mode"].as_str().unwrap_or(""),
@@ -136,6 +145,7 @@ fn render(profile: &str, paths: &Paths) -> String {
                 t["title"].as_str().unwrap_or("").chars().take(34).collect::<String>(),
                 checkpoint,
                 question,
+                crew,
                 branch,
                 tail
             ));

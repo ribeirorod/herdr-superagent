@@ -10,6 +10,7 @@ Workflow: {workflow}. Project: {project}.
 The `herdr-superagent` binary is at `{bin}`. If the bare name is not found in
 your shell, use that path.
 
+{task}
 ## Your branch
 
 {branch}
@@ -20,14 +21,20 @@ your shell, use that path.
 
 {notes}
 
-## How you talk to the superagent (all on PATH; `SUPERAGENT_TICKET` is set)
+## How you talk to the superagent (all on PATH; `SUPERAGENT_TICKET` and `SUPERAGENT_ASSIGNMENT` are set)
 
 ```text
 herdr-superagent report --state progress|waiting|ready|blocked|failed|dropped --summary "…" [--question "…"]
 herdr-superagent checkpoint <name> --summary "…"      # stop here and wait for review; then END YOUR TURN
 herdr-superagent memory search "…"                    # what this project's earlier tickets learned
 herdr-superagent memory add --title "…" --summary-file summary.md
+herdr-superagent spawn --role reviewer --task "…"       # a child in a sibling tab, same worktree; prints its assignment id
+herdr-superagent watch <assignment-id>                 # wait for the child's final report
 ```
+
+Delegate into a sibling pane when the work is long, needs another role or
+model tier, should run in parallel, or should be watchable. The child's final
+report reaches you as a message; act on it.
 
 - `report --state progress` whenever you reach a milestone; the summary is
   one or two lines. `--question "…"` asks the person something and waits;

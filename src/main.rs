@@ -13,6 +13,7 @@ mod dashboard;
 mod ensure;
 mod envpath;
 mod executor;
+mod guard;
 // Pane and workspace fields that phase 2's observer reads.
 #[allow(dead_code)]
 mod herdr;
@@ -39,6 +40,7 @@ fn main() {
         cli::Command::Daemon => "daemon",
         cli::Command::Ensure | cli::Command::Start(_) | cli::Command::Action => "ensure",
         cli::Command::Dashboard { .. } => "dashboard",
+        cli::Command::Guard { .. } => "guard",
         _ => "cli",
     };
     if paths::validate_profile(&profile).is_ok() {

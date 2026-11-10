@@ -11,7 +11,11 @@ impl Engine {
     /// The ticket, while it is open and `assignment_id` runs it.
     fn running(&self, ticket_id: &str, assignment_id: &str) -> Result<Option<Ticket>, UserError> {
         let ticket = self.require_ticket(ticket_id)?;
-        let runs = ticket.live() && ticket.running_assignment().map(|a| a.id.as_str()) == Some(assignment_id);
+        let runs = ticket.live()
+            && ticket
+                .assignments
+                .iter()
+                .any(|a| a.id == assignment_id && a.state == AssignmentState::Running);
         Ok(runs.then_some(ticket))
     }
 
@@ -57,7 +61,7 @@ impl Engine {
         let now = self.now();
         ticket.undelivered.retain(|id| !input_ids.contains(id));
         ticket.updated_at = now.clone();
-        if let Some(running) = ticket.running_assignment_mut() {
+        if let Some(running) = ticket.assignment_mut(assignment_id) {
             running.delivered_at = Some(now.clone());
         }
         for input in ticket.inputs.iter_mut() {
@@ -84,7 +88,7 @@ impl Engine {
             return Ok(());
         };
         let now = self.now();
-        if let Some(running) = ticket.running_assignment_mut() {
+        if let Some(running) = ticket.assignment_mut(assignment_id) {
             running.idle_at = Some(now);
         }
         self.repo().ticket_save(&ticket);
@@ -108,7 +112,7 @@ impl Engine {
         let Some(mut ticket) = self.running(ticket_id, assignment_id)? else {
             return Ok(());
         };
-        let Some(running) = ticket.running_assignment().cloned() else {
+        let Some(running) = ticket.assignments.iter().find(|a| a.id == assignment_id).cloned() else {
             return Ok(());
         };
         let busy = matches!((&running.delivered_at, &running.report), (Some(delivered), Some(report)) if delivered >= &report.at);
@@ -139,17 +143,34 @@ impl Engine {
         if matches!(report.question, Question::Ask(_)) && report.state == ReportState::Ready {
             return Err(UserError::new(ErrorCode::QuestionWithResult));
         }
+        let targets_child = report
+            .assignment_id
+            .as_ref()
+            .map(|id| ticket.assignments.iter().any(|a| &a.id == id && !a.is_root()))
+            .unwrap_or(false);
         // Checkpoint and propose modes mean a person reviews before the work counts as done.
-        if report.state == ReportState::Ready && ticket.mandate.mode != Mode::Autonomous && ticket.approved_checkpoints.is_empty() {
+        if report.state == ReportState::Ready
+            && !targets_child
+            && ticket.mandate.mode != Mode::Autonomous
+            && ticket.approved_checkpoints.is_empty()
+        {
             return Err(UserError::new(ErrorCode::CheckpointRequired).with("mode", ticket.mandate.mode.as_str()));
         }
         let at = self.now();
-        let index = ticket
-            .assignments
-            .iter()
-            .position(|a| a.state == AssignmentState::Running)
-            .or_else(|| ticket.assignments.len().checked_sub(1))
-            .ok_or_else(|| UserError::new(ErrorCode::UnknownAssignment))?;
+        let index = match &report.assignment_id {
+            Some(id) => ticket
+                .assignments
+                .iter()
+                .position(|a| &a.id == id)
+                .ok_or_else(|| UserError::new(ErrorCode::UnknownAssignment))?,
+            None => ticket
+                .assignments
+                .iter()
+                .position(|a| a.state == AssignmentState::Running && a.is_root())
+                .or_else(|| ticket.assignments.iter().rposition(|a| a.is_root()))
+                .ok_or_else(|| UserError::new(ErrorCode::UnknownAssignment))?,
+        };
+        let is_child = !ticket.assignments[index].is_root();
         if ticket.assignments[index].state == AssignmentState::Ended {
             return Err(UserError::new(ErrorCode::AssignmentEnded));
         }
@@ -183,6 +204,40 @@ impl Engine {
             ticket.undelivered.retain(|id| !held.contains(id));
         }
         self.repo().ticket_save(&ticket);
+        if is_child {
+            // A child's final report ends the child and tells the parent; the ticket goes on.
+            if matches!(report.state, ReportState::Ready | ReportState::Dropped | ReportState::Failed) {
+                let child = ticket.assignments[index].clone();
+                let reason = report.state.as_str().to_string();
+                if let Some(stored) = ticket.assignment_mut(&child.id) {
+                    stored.state = AssignmentState::Ended;
+                    stored.ended_at = Some(at.clone());
+                    stored.ended_reason = Some(reason.clone());
+                }
+                self.repo().ticket_save(&ticket);
+                self.emit(DomainEvent::AssignmentEnded {
+                    ticket_id: ticket_id.to_string(),
+                    assignment_id: child.id.clone(),
+                    reason: reason.clone(),
+                });
+                self.executor().stop(&ticket, &child, &reason);
+                let summary = child.report.as_ref().map(|r| r.summary.clone()).unwrap_or_default();
+                let text = format!(
+                    "Your {} ({}) finished with `{}`:\n{}",
+                    child.role,
+                    &child.id[..8.min(child.id.len())],
+                    reason,
+                    summary
+                );
+                let input = TicketInput::Text {
+                    id: key(&["input", ticket_id, "child", &child.id, &reason]),
+                    text,
+                    at,
+                };
+                self.add_input(&mut ticket, input);
+            }
+            return self.require_ticket(ticket_id);
+        }
         let outcome = match report.state {
             ReportState::Dropped => Some(TicketOutcome::Dropped),
             ReportState::Ready => Some(TicketOutcome::Completed),

@@ -642,9 +642,35 @@ impl Daemon {
                     state,
                     summary: params.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
                     question: Question::from_option(params.get("question").and_then(Value::as_str).map(str::to_string)),
+                    assignment_id: opt_param(params, "assignment"),
                 };
                 Ok(ticket_view(&self.engine.report(ticket, report)?))
             }
+            "spawn" => {
+                let ticket = str_param(params, "ticket")?;
+                let parent = match opt_param(params, "parent") {
+                    Some(p) => p,
+                    None => self
+                        .store
+                        .ticket_get(ticket)
+                        .and_then(|t| t.running_assignment().map(|a| a.id.clone()))
+                        .ok_or_else(|| UserError::new(ErrorCode::UnknownAssignment))?,
+                };
+                let mode = match opt_param(params, "mode") {
+                    Some(m) => Some(m.parse::<Mode>().map_err(UserError::internal)?),
+                    None => None,
+                };
+                let child = self
+                    .engine
+                    .spawn(ticket, &parent, str_param(params, "role")?, str_param(params, "task")?, mode)?;
+                Ok(serde_json::to_value(child)?)
+            }
+            "checkpoint" if opt_param(params, "assignment").is_some() => Ok(ticket_view(&self.engine.checkpoint_as(
+                str_param(params, "ticket")?,
+                &opt_param(params, "assignment").unwrap_or_default(),
+                str_param(params, "name")?,
+                params.get("summary").and_then(Value::as_str).unwrap_or(""),
+            )?)),
             "checkpoint" => Ok(ticket_view(&self.engine.checkpoint(
                 str_param(params, "ticket")?,
                 str_param(params, "name")?,
