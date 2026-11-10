@@ -428,6 +428,11 @@ pub struct Execution {
     /// The herdr workspace that holds the ticket: one per ticket, one tab per assignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// The ref the branch started from, and why: the base is a decision, not whatever HEAD was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

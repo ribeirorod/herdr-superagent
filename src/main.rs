@@ -13,6 +13,7 @@ mod dashboard;
 mod ensure;
 mod envpath;
 mod executor;
+mod gitbase;
 mod guard;
 // Pane and workspace fields that phase 2's observer reads.
 #[allow(dead_code)]

@@ -261,6 +261,9 @@ pub struct SubmitArgs {
     /// The project (repo path) the request is about.
     #[arg(long)]
     pub project: Option<String>,
+    /// The git ref the worker's branch starts from (default: the newest of the checked-out branch, its upstream and origin's default, after a fetch).
+    #[arg(long)]
+    pub base: Option<String>,
     /// A stable id, so a repeated submit is a no-op.
     #[arg(long)]
     pub id: Option<String>,
@@ -523,9 +526,10 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             out(status.clone(), status_text(&status))
         }
         Command::Submit(args) => {
+            let meta = args.base.as_ref().map(|b| json!({ "base": b })).unwrap_or(Value::Null);
             let result = daemon(
                 "submit",
-                json!({ "text": args.text, "workflow": args.workflow, "mode": args.mode, "project": args.project, "id": args.id }),
+                json!({ "text": args.text, "workflow": args.workflow, "mode": args.mode, "project": args.project, "id": args.id, "meta": meta }),
             )?;
             let text = match result.get("ticket_id").and_then(Value::as_str) {
                 Some(ticket) => format!("ticket {ticket} created (request {})", result["request_id"].as_str().unwrap_or("")),
@@ -1248,6 +1252,18 @@ fn ticket_detail(ticket: &Value) -> String {
         lines.push(format!(
             "branch: {b}  (worktree {})",
             ticket.pointer("/execution/directory").and_then(Value::as_str).unwrap_or("")
+        ));
+    }
+    if let Some(base) = ticket.pointer("/execution/base").and_then(Value::as_str) {
+        lines.push(format!(
+            "base: {base}  ({})",
+            ticket
+                .pointer("/execution/base_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
         ));
     }
     if let Some(c) = ticket.get("checkpoint").filter(|c| !c.is_null()) {

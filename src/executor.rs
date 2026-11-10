@@ -192,33 +192,6 @@ pub fn worker_name(profile: &str, ticket_id: &str, tab: &str) -> String {
     name.chars().take(32).collect::<String>().trim_end_matches('-').to_string()
 }
 
-/// `git worktree add` of `branch` at `path` (reusing the branch when it exists).
-pub fn add_worktree(repo: &str, branch: &str, path: &std::path::Path) -> Result<(), String> {
-    if path.join(".git").exists() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let exists = std::process::Command::new("git")
-        .args(["-C", repo, "rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let mut args = vec!["-C".to_string(), repo.to_string(), "worktree".into(), "add".into()];
-    if exists {
-        args.extend([path.display().to_string(), branch.to_string()]);
-    } else {
-        args.extend(["-b".to_string(), branch.to_string(), path.display().to_string()]);
-    }
-    let output = std::process::Command::new("git").args(&args).output().map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
 /// Marks `directory` as trusted in the harness's own configuration, so a new
 /// worktree does not stop the worker at a trust dialog. Claude keeps that in
 /// `~/.claude.json` under `projects.<path>.hasTrustDialogAccepted`.
@@ -323,6 +296,7 @@ impl Daemon {
             .as_deref()
             .map(|p| std::path::Path::new(p).join(".git").exists())
             .unwrap_or(false);
+        let mut base_choice: Option<crate::gitbase::Base> = None;
         let existing = ticket.execution.as_ref().and_then(|e| e.workspace_id.clone()).filter(|id| {
             herdr
                 .workspace_list()
@@ -352,7 +326,14 @@ impl Daemon {
                 let repo = project.clone().unwrap_or_default();
                 let branch = format!("sa/{}", short_id(&ticket.id));
                 let path = self.paths.state_dir().join("worktrees").join(short_id(&ticket.id));
-                match add_worktree(&repo, &branch, &path) {
+                let requested = self
+                    .store
+                    .request_get(&ticket.origin.request_id)
+                    .and_then(|r| r.meta.get("base").and_then(Value::as_str).map(str::to_string));
+                let chosen = crate::gitbase::resolve(&repo, requested.as_deref());
+                tracing::info!(target: "executor", ticket = %ticket.id, base = %chosen.reference, reason = %chosen.reason, "ticket branch base");
+                base_choice = Some(chosen.clone());
+                match crate::gitbase::add_worktree(&repo, &branch, &path, &chosen.reference) {
                     Ok(()) => (
                         herdr.call(
                             "workspace.create",
@@ -429,6 +410,14 @@ impl Daemon {
             assignment: String::new(),
             workspace_id: (!workspace_id.is_empty()).then_some(workspace_id.clone()),
             branch: branch.clone(),
+            base: base_choice
+                .as_ref()
+                .map(|b| format!("{} ({})", b.reference, b.commit))
+                .or_else(|| ticket.execution.as_ref().and_then(|e| e.base.clone())),
+            base_reason: base_choice
+                .as_ref()
+                .map(|b| format!("{}\n{}", b.reason, b.overview))
+                .or_else(|| ticket.execution.as_ref().and_then(|e| e.base_reason.clone())),
         });
         let project_key = self.ticket_project(&ticket);
         let hits = self.store.memory_search(&project_key, &ticket.title, 5).unwrap_or_default();
@@ -518,6 +507,8 @@ impl Daemon {
             assignment: brief_path.display().to_string(),
             workspace_id: (!workspace_id.is_empty()).then_some(workspace_id),
             branch,
+            base: ticket.execution.as_ref().and_then(|e| e.base.clone()),
+            base_reason: ticket.execution.as_ref().and_then(|e| e.base_reason.clone()),
         });
         self.store.ticket_save(&ticket);
         let _ = self.engine.assignment_placed(&ticket.id, &assignment.id, &pane_id);
@@ -900,9 +891,9 @@ mod tests {
                 .success());
         }
         let wt = dir.path().join("worktrees").join("abc123");
-        add_worktree(&repo.display().to_string(), "sa/abc123", &wt).unwrap();
+        crate::gitbase::add_worktree(&repo.display().to_string(), "sa/abc123", &wt, "HEAD").unwrap();
         assert!(wt.join(".git").exists());
-        add_worktree(&repo.display().to_string(), "sa/abc123", &wt).unwrap();
+        crate::gitbase::add_worktree(&repo.display().to_string(), "sa/abc123", &wt, "HEAD").unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(

@@ -61,6 +61,8 @@ impl Engine {
                 assignment: String::new(),
                 workspace_id: None,
                 branch: None,
+                base: None,
+                base_reason: None,
             }),
             delivery: None,
         };

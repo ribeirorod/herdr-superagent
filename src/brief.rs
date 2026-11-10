@@ -15,9 +15,20 @@ pub fn mode_rules(mode: Mode) -> &'static str {
 
 /// What a worker does with its branch (PLAN §8a: push work in progress at each checkpoint).
 pub fn branch_rules(ticket: &Ticket) -> String {
+    let start = ticket
+        .execution
+        .as_ref()
+        .and_then(|e| e.base.as_deref())
+        .map(|base| {
+            let reason = ticket.execution.as_ref().and_then(|e| e.base_reason.as_deref()).unwrap_or("");
+            format!(
+                "**Where you start:** your branch was cut from `{base}` because {reason}\n\nVerify this before planning: `git status -sb`, `git log --oneline -5`, and the branches above. If the request implies another branch (a feature branch someone is on, a release branch), move your branch there first: `git fetch origin && git reset --hard <ref>`. Never work on top of stale code because it happened to be checked out.\n\n"
+            )
+        })
+        .unwrap_or_default();
     match ticket.execution.as_ref().and_then(|e| e.branch.as_deref()) {
         Some(branch) => format!(
-            "You work in a worktree on branch `{branch}`. Commit as you go. At every checkpoint and before your final report, push the branch (`git push -u origin {branch}`) when the repository has a remote; never push to the default branch, and never open a pull request unless the request asks for one. Put the branch and the last commit in your final report."
+            "{start}You work in a worktree on branch `{branch}`. Commit as you go. At every checkpoint and before your final report, push the branch (`git push -u origin {branch}`) when the repository has a remote; never push to the default branch, and never open a pull request unless the request asks for one. Put the branch and the last commit in your final report."
         ),
         None => "This ticket has no repository branch. Put the files you produced in your final report.".to_string(),
     }
