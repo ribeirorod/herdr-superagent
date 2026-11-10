@@ -126,13 +126,6 @@ impl StateRepo {
         if !self.dir.join(".git").exists() {
             self.git(&["init", "-q", "-b", &self.branch])?;
         }
-        let ignore = self.dir.join(".gitignore");
-        if !ignore.exists() {
-            std::fs::write(&ignore, "*.sqlite\n*.sqlite-*\n*.sock\ndaemon.json\n*.log\n").map_err(|e| e.to_string())?;
-        }
-        std::fs::create_dir_all(self.dir.join("tickets")).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(self.dir.join("memory")).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(self.dir.join(".superagent")).map_err(|e| e.to_string())?;
         if let Some(remote) = &self.remote {
             match self.git(&["remote", "get-url", "origin"]) {
                 Ok(url) if url == *remote => {}
@@ -143,9 +136,22 @@ impl StateRepo {
                     self.git(&["remote", "add", "origin", remote])?;
                 }
             }
-            // The remote may be empty: a failed first pull is fine.
-            let _ = self.pull();
+            // A fresh checkout takes the remote's history before anything local exists,
+            // so the first pull cannot collide with files seeded here.
+            let has_commits = self.git(&["rev-parse", "--verify", "HEAD"]).is_ok();
+            if !has_commits && self.git(&["fetch", "-q", "origin", &self.branch]).is_ok() {
+                self.git(&["checkout", "-q", "-B", &self.branch, &format!("origin/{}", self.branch)])?;
+            } else {
+                let _ = self.pull();
+            }
         }
+        let ignore = self.dir.join(".gitignore");
+        if !ignore.exists() {
+            std::fs::write(&ignore, "*.sqlite\n*.sqlite-*\n*.sock\ndaemon.json\n*.log\n").map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(self.dir.join("tickets")).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(self.dir.join("memory")).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(self.dir.join(".superagent")).map_err(|e| e.to_string())?;
         if self.git(&["rev-parse", "--verify", "HEAD"]).is_err() {
             self.git(&["add", "-A"])?;
             self.git(&["commit", "-q", "--allow-empty", "-m", "superagent: initialise profile state"])?;

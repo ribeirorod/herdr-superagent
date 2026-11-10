@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::daemon::VERSION;
+use crate::daemon::{BUILD, VERSION};
 use crate::herdr::{Herdr, HerdrError};
 use crate::ipc;
 use crate::paths::Paths;
@@ -77,13 +77,17 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
 
     if let Ok(ping) = ipc::ping(&paths.socket_path()) {
         let running = ping["version"].as_str().unwrap_or("").to_string();
+        let running_build = ping["build"].as_str().unwrap_or("").to_string();
         report.daemon_pane_id = ping["pane_id"].as_str().map(str::to_string);
-        if running == VERSION {
+        if running == VERSION && running_build == BUILD {
             report.outcome = EnsureOutcome::Running;
         } else {
+            // Same version, different build counts too: a rebuild from the checkout must take over.
             ipc::call(&paths.socket_path(), "shutdown", json!({ "restart": true }), Duration::from_secs(5)).map_err(|e| e.to_string())?;
-            wait_for_daemon(&paths, Some(VERSION), Duration::from_secs(20))?;
-            report.outcome = EnsureOutcome::Restarted { from: running };
+            wait_for_build(&paths, BUILD, Duration::from_secs(20))?;
+            report.outcome = EnsureOutcome::Restarted {
+                from: format!("{running} ({running_build})"),
+            };
         }
         report.workspace_id = find_workspace(&herdr, profile_name)?.map(|w| w.workspace_id);
         if focus {
@@ -287,6 +291,24 @@ fn find_workspace(herdr: &Herdr, profile: &str) -> Result<Option<crate::herdr::W
     let label = workspace_label(profile);
     let workspaces = herdr.workspace_list().map_err(|e: HerdrError| e.to_string())?;
     Ok(workspaces.into_iter().find(|w| w.label == label))
+}
+
+fn wait_for_build(paths: &Paths, build: &str, timeout: Duration) -> Result<Value, String> {
+    let start = Instant::now();
+    loop {
+        if let Ok(ping) = ipc::ping(&paths.socket_path()) {
+            if ping["build"] == build {
+                return Ok(ping);
+            }
+        }
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "the daemon did not come back on build {build} within {}s; check the daemon tab",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn wait_for_daemon(paths: &Paths, version: Option<&str>, timeout: Duration) -> Result<Value, String> {

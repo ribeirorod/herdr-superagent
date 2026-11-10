@@ -1042,6 +1042,12 @@ fn ticket_detail(ticket: &Value) -> String {
     if let Some(q) = ticket.pointer("/attention/question").and_then(Value::as_str) {
         lines.push(format!("question: {q}"));
     }
+    if let Some(b) = ticket.pointer("/execution/branch").and_then(Value::as_str) {
+        lines.push(format!(
+            "branch: {b}  (worktree {})",
+            ticket.pointer("/execution/directory").and_then(Value::as_str).unwrap_or("")
+        ));
+    }
     if let Some(c) = ticket.get("checkpoint").filter(|c| !c.is_null()) {
         lines.push(format!(
             "checkpoint '{}': {}",

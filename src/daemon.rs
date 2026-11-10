@@ -26,6 +26,8 @@ use crate::staterepo::{StateRepo, RENEW_SECONDS};
 use crate::store::sqlite::{Effect, SqliteStore};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Commit and build time of this binary: `ensure` restarts a daemon whose build differs.
+pub const BUILD: &str = env!("HERDR_SUPERAGENT_BUILD");
 const TICK: Duration = Duration::from_secs(2);
 const REPORT_REFRESH: Duration = Duration::from_secs(60);
 /// Commits to the state repo are batched (PLAN §8a: at most once a minute).
@@ -337,7 +339,7 @@ impl Daemon {
             let _ = std::fs::set_permissions(self.paths.socket_path(), std::fs::Permissions::from_mode(0o600));
         }
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        tracing::info!(profile = %self.paths.profile, version = VERSION, socket = %self.paths.socket_path().display(), "superagent daemon ready");
+        tracing::info!(profile = %self.paths.profile, version = VERSION, build = BUILD, socket = %self.paths.socket_path().display(), "superagent daemon ready");
         let mut last_tick = Instant::now() - TICK;
         loop {
             match listener.accept() {
@@ -613,7 +615,7 @@ impl Daemon {
     fn dispatch(&self, method: &str, params: &Value) -> Handler {
         match method {
             "ping" => Ok(
-                json!({ "version": VERSION, "pid": std::process::id(), "profile": self.paths.profile, "pane_id": self.pane_id, "started_at": self.started_at }),
+                json!({ "version": VERSION, "build": BUILD, "pid": std::process::id(), "profile": self.paths.profile, "pane_id": self.pane_id, "started_at": self.started_at }),
             ),
             "status" => self.status(),
             "shutdown" => {
@@ -749,6 +751,7 @@ impl Daemon {
         Ok(json!({
             "profile": self.paths.profile,
             "version": VERSION,
+            "build": BUILD,
             "pid": std::process::id(),
             "started_at": self.started_at,
             "paused": self.policy.paused(),

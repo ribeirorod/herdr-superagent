@@ -51,6 +51,7 @@ pub fn init(paths: &crate::paths::Paths, process: &str, debug_mode: bool) -> Opt
         process,
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
+        build = env!("HERDR_SUPERAGENT_BUILD"),
         debug_mode,
         argv = %std::env::args().collect::<Vec<_>>().join(" "),
         cwd = %std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),

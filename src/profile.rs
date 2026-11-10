@@ -37,6 +37,8 @@ pub struct Profile {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HarnessFlags {
+    /// Mark each new worktree as trusted in the harness's own config, so no trust dialog stops the worker.
+    pub pre_trust: bool,
     pub autonomous: std::collections::BTreeMap<String, Vec<String>>,
     pub checkpoint: std::collections::BTreeMap<String, Vec<String>>,
     pub propose: std::collections::BTreeMap<String, Vec<String>>,
@@ -48,6 +50,7 @@ impl Default for HarnessFlags {
         autonomous.insert("claude".to_string(), vec!["--dangerously-skip-permissions".to_string()]);
         autonomous.insert("codex".to_string(), vec!["--full-auto".to_string()]);
         HarnessFlags {
+            pre_trust: true,
             autonomous,
             checkpoint: Default::default(),
             propose: Default::default(),
@@ -84,7 +87,7 @@ pub struct Repo {
 }
 
 /// Which harness and model per kind of task, with fallbacks in order.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Models {
     pub hard: Tier,
@@ -173,9 +176,26 @@ pub struct StateRepo {
 
 impl Default for SuperagentSection {
     fn default() -> Self {
+        // Routing needs judgement, not the most expensive model; calibration changes this.
         SuperagentSection {
             harness: "claude".into(),
-            model: String::new(),
+            model: "sonnet".into(),
+        }
+    }
+}
+
+impl Default for Models {
+    fn default() -> Self {
+        let claude = |model: &str| Tier {
+            use_: vec![HarnessModel {
+                harness: "claude".into(),
+                model: model.into(),
+            }],
+        };
+        Models {
+            hard: claude("opus"),
+            small: claude("haiku"),
+            review: claude("sonnet"),
         }
     }
 }
@@ -738,6 +758,7 @@ mod tests {
         assert_eq!(profile.repos[0].path, "~/work/api");
         assert_eq!(profile.repos[0].default_branch, "main");
         assert_eq!(profile.models.hard.use_[1].model, "gpt-5");
+        assert_eq!(Profile::default().models.small.use_[0].model, "haiku");
         assert!(profile.calibrated);
         assert!(assignments[1].protected() && assignments[2].protected() && !assignments[0].protected());
         assert!(apply(&text, &[Assignment::parse("limits.max_workers=0").unwrap()])
@@ -780,7 +801,7 @@ mod tests {
         store.commit(&text, &next).unwrap();
         assert_eq!(Profile::load_or_init(&store.path).unwrap().superagent.model, "opus");
         assert!(store.undo().unwrap().is_some());
-        assert_eq!(Profile::load_or_init(&store.path).unwrap().superagent.model, "");
+        assert_eq!(Profile::load_or_init(&store.path).unwrap().superagent.model, "sonnet");
         assert!(store.undo().unwrap().is_none());
     }
 }

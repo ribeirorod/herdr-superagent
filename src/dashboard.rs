@@ -19,6 +19,25 @@ const RESET: &str = "\x1b[0m";
 pub fn run(profile: &str, once: bool) -> Result<(), String> {
     let paths = Paths::for_profile(profile);
     loop {
+        // A rebuilt daemon means a rebuilt dashboard: exec the binary on PATH, like the daemon does.
+        if !once {
+            if let Ok(ping) = ipc::ping(&paths.socket_path()) {
+                let build = ping["build"].as_str().unwrap_or("");
+                if !build.is_empty() && build != crate::daemon::BUILD {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        let program = if crate::daemon::on_path("herdr-superagent") {
+                            std::path::PathBuf::from("herdr-superagent")
+                        } else {
+                            std::env::current_exe().map_err(|e| e.to_string())?
+                        };
+                        let error = std::process::Command::new(program).args(["dashboard", "--profile", profile]).exec();
+                        return Err(format!("dashboard restart failed: {error}"));
+                    }
+                }
+            }
+        }
         let frame = render(profile, &paths);
         let mut out = std::io::stdout().lock();
         if !once {
@@ -78,11 +97,15 @@ fn render(profile: &str, paths: &Paths) -> String {
                         .collect::<String>()
                 })
                 .unwrap_or_default();
-            let pane = t["assignments"]
-                .as_array()
-                .and_then(|a| a.last())
-                .and_then(|a| a["pane_id"].as_str())
-                .unwrap_or("-");
+            let pane = if t["stage"] == "ended" {
+                "-"
+            } else {
+                t["assignments"]
+                    .as_array()
+                    .and_then(|a| a.last())
+                    .and_then(|a| a["pane_id"].as_str())
+                    .unwrap_or("-")
+            };
             let question = t
                 .pointer("/attention/question")
                 .and_then(Value::as_str)

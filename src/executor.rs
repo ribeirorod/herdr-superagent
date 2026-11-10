@@ -192,6 +192,68 @@ pub fn worker_name(profile: &str, ticket_id: &str, tab: &str) -> String {
     name.chars().take(32).collect::<String>().trim_end_matches('-').to_string()
 }
 
+/// `git worktree add` of `branch` at `path` (reusing the branch when it exists).
+pub fn add_worktree(repo: &str, branch: &str, path: &std::path::Path) -> Result<(), String> {
+    if path.join(".git").exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let exists = std::process::Command::new("git")
+        .args(["-C", repo, "rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let mut args = vec!["-C".to_string(), repo.to_string(), "worktree".into(), "add".into()];
+    if exists {
+        args.extend([path.display().to_string(), branch.to_string()]);
+    } else {
+        args.extend(["-b".to_string(), branch.to_string(), path.display().to_string()]);
+    }
+    let output = std::process::Command::new("git").args(&args).output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Marks `directory` as trusted in the harness's own configuration, so a new
+/// worktree does not stop the worker at a trust dialog. Claude keeps that in
+/// `~/.claude.json` under `projects.<path>.hasTrustDialogAccepted`.
+pub fn pre_trust(harness: &str, directory: &str) {
+    pre_trust_in(harness, directory, std::env::var("HOME").ok().map(std::path::PathBuf::from));
+}
+
+fn pre_trust_in(harness: &str, directory: &str, home: Option<std::path::PathBuf>) {
+    if harness != "claude" || directory.is_empty() {
+        return;
+    }
+    let Some(home) = home else { return };
+    let path = home.join(".claude.json");
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(object) = root.as_object_mut() else { return };
+    let projects = object.entry("projects").or_insert_with(|| json!({}));
+    let Some(projects) = projects.as_object_mut() else { return };
+    let entry = projects.entry(directory.to_string()).or_insert_with(|| json!({}));
+    let Some(entry) = entry.as_object_mut() else { return };
+    if entry.get("hasTrustDialogAccepted") == Some(&Value::Bool(true)) {
+        return;
+    }
+    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+    match serde_json::to_string_pretty(&root) {
+        Ok(text) => match std::fs::write(&path, text) {
+            Ok(()) => tracing::debug!(target: "executor", directory, "pre-trusted the worktree for claude"),
+            Err(e) => tracing::warn!(%e, "could not pre-trust the worktree in ~/.claude.json"),
+        },
+        Err(e) => tracing::warn!(%e, "could not serialise ~/.claude.json"),
+    }
+}
+
 impl Daemon {
     pub(crate) fn install_handlers(&mut self) {
         self.handlers.insert("launch", Box::new(|d, e| d.launch(e)));
@@ -283,13 +345,23 @@ impl Daemon {
                     true,
                 )
             }
-            None if is_repo => (
-                herdr.call(
-                    "worktree.create",
-                    json!({ "cwd": project, "branch": format!("sa/{}", short_id(&ticket.id)), "label": label, "focus": false }),
-                ),
-                false,
-            ),
+            None if is_repo => {
+                // Our own `git worktree add`, under the profile's state dir, then a plain workspace on it:
+                // herdr's worktree.create would also open a primary workspace for the repo.
+                let repo = project.clone().unwrap_or_default();
+                let branch = format!("sa/{}", short_id(&ticket.id));
+                let path = self.paths.state_dir().join("worktrees").join(short_id(&ticket.id));
+                match add_worktree(&repo, &branch, &path) {
+                    Ok(()) => (
+                        herdr.call(
+                            "workspace.create",
+                            json!({ "cwd": path.display().to_string(), "label": label, "focus": false, "env": env }),
+                        ),
+                        false,
+                    ),
+                    Err(e) => return Outcome::Fail(format!("git worktree: {e}")),
+                }
+            }
             None => {
                 let cwd = project.clone().unwrap_or_else(|| self.paths.profile_dir().display().to_string());
                 (
@@ -321,14 +393,19 @@ impl Daemon {
         };
         let directory = if reused {
             ticket.execution.as_ref().map(|e| e.directory.clone()).unwrap_or_default()
+        } else if is_repo {
+            self.paths
+                .state_dir()
+                .join("worktrees")
+                .join(short_id(&ticket.id))
+                .display()
+                .to_string()
         } else {
-            created
-                .pointer("/worktree/path")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or(project.clone())
-                .unwrap_or_default()
+            project.clone().unwrap_or_default()
         };
+        if profile.harness_flags.pre_trust {
+            pre_trust(&harness, &directory);
+        }
         if pane_id.is_empty() {
             return Outcome::Fail(format!("no pane in the created place: {created}"));
         }
@@ -343,11 +420,7 @@ impl Daemon {
         let branch = if reused {
             ticket.execution.as_ref().and_then(|e| e.branch.clone())
         } else {
-            created
-                .pointer("/worktree/branch")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| is_repo.then(|| format!("sa/{}", short_id(&ticket.id))))
+            is_repo.then(|| format!("sa/{}", short_id(&ticket.id)))
         };
         ticket.execution = Some(Execution {
             name: label.clone(),
@@ -775,6 +848,50 @@ mod tests {
     }
 
     #[test]
+    fn adds_a_worktree_once_and_pre_trusts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let wt = dir.path().join("worktrees").join("abc123");
+        add_worktree(&repo.display().to_string(), "sa/abc123", &wt).unwrap();
+        assert!(wt.join(".git").exists());
+        add_worktree(&repo.display().to_string(), "sa/abc123", &wt).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"projects":{"/other":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        pre_trust_in("claude", &wt.display().to_string(), Some(home.clone()));
+        let json: Value = serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(json["projects"][wt.display().to_string()]["hasTrustDialogAccepted"], true);
+        assert_eq!(json["projects"]["/other"]["hasTrustDialogAccepted"], true);
+    }
+
+    #[test]
     fn tiers_flags_and_names() {
         let mut profile = Profile::new("work");
         profile.models.hard.use_ = vec![
@@ -788,7 +905,7 @@ mod tests {
             },
         ];
         assert_eq!(pick_tier(&profile, "worker"), ("sh".into(), "fast".into()));
-        assert_eq!(pick_tier(&profile, "reviewer"), ("claude".into(), String::new()));
+        assert_eq!(pick_tier(&profile, "reviewer").1, "sonnet", "the default review tier");
         assert_eq!(
             mode_flags(&profile, "claude", Mode::Autonomous),
             vec!["--dangerously-skip-permissions"]
