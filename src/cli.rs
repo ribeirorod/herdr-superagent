@@ -164,9 +164,9 @@ pub enum Command {
         #[arg(long, default_value_t = 0)]
         older_than_hours: u64,
     },
-    /// Clear this profile's titles and `sa_*` tokens from herdr panes and workspaces (after a test run).
+    /// Clear this profile's worker titles and `sa_*` tokens from herdr panes and workspaces (the cockpit keeps its own).
     Cleanup {
-        /// Clear every `sa_*` token herdr still holds, whatever the profile.
+        /// Clear every `sa_*` token herdr still holds, the cockpit's included, whatever the profile.
         #[arg(long)]
         all: bool,
     },
@@ -915,8 +915,12 @@ layout = [
             let herdr = crate::herdr::Herdr::from_env().map_err(|e| e.to_string())?;
             let mine = |tokens: &std::collections::HashMap<String, String>| {
                 let ours: Vec<String> = tokens.keys().filter(|k| k.starts_with("sa_")).cloned().collect();
+                let cockpit = matches!(
+                    tokens.get("sa_role").map(String::as_str),
+                    Some("superagent" | "daemon" | "dashboard")
+                );
                 let matches = all
-                    || tokens.get("sa_profile").map(|p| p == &profile).unwrap_or(false)
+                    || (!cockpit && tokens.get("sa_profile").map(|p| p == &profile).unwrap_or(false))
                     || (tokens.contains_key("sa_ticket") && !tokens.contains_key("sa_profile"));
                 (matches && !ours.is_empty()).then_some(ours)
             };

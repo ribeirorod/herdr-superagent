@@ -50,7 +50,7 @@ impl Default for HarnessFlags {
         autonomous.insert("claude".to_string(), vec!["--dangerously-skip-permissions".to_string()]);
         autonomous.insert("codex".to_string(), vec!["--full-auto".to_string()]);
         HarnessFlags {
-            pre_trust: true,
+            pre_trust: false,
             autonomous,
             checkpoint: Default::default(),
             propose: Default::default(),

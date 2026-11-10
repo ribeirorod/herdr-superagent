@@ -16,8 +16,65 @@ const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
 
+/// The pane's width from the tty (works in splits), else `COLUMNS`, else 100.
+fn columns() -> usize {
+    #[cfg(unix)]
+    {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ fills a winsize for a tty fd; a non-tty fails and we fall back.
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col >= 20 {
+            return size.ws_col as usize;
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .filter(|&c: &usize| c >= 20)
+        .unwrap_or(100)
+}
+
+/// Cuts a line to `width` visible characters, keeping escape sequences intact and closing colour at the end.
+pub fn cut(line: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut visible = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for n in chars.by_ref() {
+                out.push(n);
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible >= width {
+            out.push_str(RESET);
+            return out;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out
+}
+
 pub fn run(profile: &str, once: bool) -> Result<(), String> {
     let paths = Paths::for_profile(profile);
+    #[cfg(unix)]
+    if !once {
+        // Ctrl-C would close the pane (no shell underneath); the pane's close action quits the dashboard.
+        unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    }
+    if !once {
+        if let (Ok(herdr), Ok(pane)) = (crate::herdr::Herdr::from_env(), std::env::var("HERDR_PANE_ID")) {
+            let _ = herdr.report_pane_metadata(
+                &pane,
+                Some(&format!("tasks · {profile}")),
+                &[("sa_role", "dashboard"), ("sa_profile", profile)],
+            );
+        }
+    }
     loop {
         // A rebuilt daemon means a rebuilt dashboard: exec the binary on PATH, like the daemon does.
         if !once {
@@ -38,7 +95,13 @@ pub fn run(profile: &str, once: bool) -> Result<(), String> {
                 }
             }
         }
-        let frame = render(profile, &paths);
+        let width = columns();
+        let frame = render(profile, &paths)
+            .lines()
+            .map(|l| cut(l, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         let mut out = std::io::stdout().lock();
         if !once {
             let _ = write!(out, "\x1b[2J\x1b[H");
@@ -186,4 +249,16 @@ fn render(profile: &str, paths: &Paths) -> String {
         "{DIM}approve <id> · stop-ticket <id> · ticket <id>   (refreshes every 2 s){RESET}"
     ));
     lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuts_visible_width_and_keeps_escapes() {
+        let line = format!("{PURPLE}abcdef{RESET}");
+        assert_eq!(cut(&line, 3), format!("{PURPLE}abc{RESET}"));
+        assert_eq!(cut("plain text", 50), "plain text");
+    }
 }

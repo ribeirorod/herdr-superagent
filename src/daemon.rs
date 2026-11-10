@@ -256,6 +256,9 @@ impl Daemon {
                 return;
             }
         }
+        // A periodic refresh also re-applies the cockpit's titles and tokens, in case they were cleared.
+        let force = force || self.last_report.borrow().1.elapsed() >= REPORT_REFRESH;
+        {}
         let resume = self.resume_argv();
         if resume.is_none() {
             tracing::warn!("herdr-superagent is not on PATH: herdr cannot resume the daemon after a restart");
@@ -266,6 +269,14 @@ impl Daemon {
         } else if force {
             let title = format!("daemon · {}", self.paths.profile);
             let _ = herdr.report_pane_metadata(pane, Some(&title), &[("sa_role", "daemon"), ("sa_profile", &self.paths.profile)]);
+            if let Some(session) = self.store.kv_get("session.pane_id").filter(|p| !p.is_empty()) {
+                let title = format!("◆ SUPERAGENT · {}", self.paths.profile);
+                let _ = herdr.report_pane_metadata(
+                    &session,
+                    Some(&title),
+                    &[("sa_role", "superagent"), ("sa_profile", &self.paths.profile)],
+                );
+            }
         }
         *self.last_report.borrow_mut() = (message, Instant::now());
     }

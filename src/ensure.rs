@@ -90,8 +90,9 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
             };
         }
         report.workspace_id = find_workspace(&herdr, profile_name)?.map(|w| w.workspace_id);
-        if focus {
-            if let Some(id) = &report.workspace_id {
+        if let Some(id) = &report.workspace_id {
+            ensure_dashboard_pane(&herdr, id, profile_name, &paths, &mut report.warnings);
+            if focus {
                 let _ = herdr.workspace_focus(id);
             }
         }
@@ -191,6 +192,7 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
                     }
                 }
             }
+            ensure_dashboard_pane(&herdr, &workspace.workspace_id, profile_name, &paths, &mut report.warnings);
             if focus {
                 let _ = herdr.workspace_focus(&workspace.workspace_id);
             }
@@ -204,6 +206,45 @@ pub fn ensure(profile_name: &str, focus: bool) -> Result<EnsureReport, String> {
         }
     }
     Ok(report)
+}
+
+/// The cockpit's dashboard pane: split from the session pane when it is missing
+/// (closed by hand, or a cockpit from before the dashboard existed).
+fn ensure_dashboard_pane(herdr: &Herdr, workspace_id: &str, profile: &str, paths: &Paths, warnings: &mut Vec<String>) {
+    let Ok(panes) = herdr.pane_list() else { return };
+    if panes
+        .iter()
+        .any(|p| p.workspace_id == workspace_id && p.label.as_deref() == Some("dashboard"))
+    {
+        return;
+    }
+    let Some(session) = panes
+        .iter()
+        .find(|p| p.workspace_id == workspace_id && p.label.as_deref() == Some("superagent"))
+    else {
+        warnings.push("no session pane found to split the dashboard from; `herdr workspace close` the cockpit and run start again".into());
+        return;
+    };
+    let env = pane_env(profile)("dashboard");
+    let split = herdr.call(
+        "pane.split",
+        json!({ "target_pane_id": session.pane_id, "direction": "right", "ratio": 0.35, "focus": false, "env": env }),
+    );
+    let pane_id = match split {
+        Ok(v) => v.pointer("/pane/pane_id").and_then(Value::as_str).map(str::to_string),
+        Err(e) => {
+            warnings.push(format!("could not split a dashboard pane: {e}"));
+            None
+        }
+    };
+    let Some(pane_id) = pane_id else { return };
+    let _ = herdr.call("pane.rename", json!({ "pane_id": pane_id, "label": "dashboard" }));
+    let mut command = vec!["exec".to_string()];
+    command.extend(dashboard_command(profile));
+    let _ = paths;
+    if let Err(e) = herdr.pane_run(&pane_id, &shell_words(&command)) {
+        warnings.push(format!("could not start the dashboard in {pane_id}: {e}"));
+    }
 }
 
 /// Overrides set in the shell that runs `start`, which the panes must share:

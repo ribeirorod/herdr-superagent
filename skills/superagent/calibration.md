@@ -57,6 +57,20 @@ affect how much review a request gets. Print the exact
 `herdr-superagent profile set … --yes` command for the person to run in their
 own shell, and wait until `herdr-superagent profile` shows the change.
 
+## Step 3b: trust for worker worktrees
+
+Each worker runs in a fresh git worktree. Claude asks "do you trust this
+folder?" on the first start there, which shows the worker as blocked until
+the person answers. Explain the trade-off and ask:
+
+- `harness_flags.pre_trust = true`: the daemon marks every new worktree as
+  trusted in `~/.claude.json` (Claude's own, global config) before the worker
+  starts. No dialog, but trust is granted without a look.
+- `false` (default): the dialog stays; the ticket shows as needing them until
+  they answer it in the pane.
+
+Write their choice with `profile set harness_flags.pre_trust=true|false`.
+
 ## Step 4: state repo
 
 Ask whether tickets and summaries should live in a git repo so the profile can
