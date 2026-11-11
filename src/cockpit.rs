@@ -1023,6 +1023,47 @@ mod tests {
         assert!(matches!(&app.prompt, Some(Prompt::Confirm { then: Pending::Stop(id), .. }) if id == "t-run111"));
     }
 
+    /// `COCKPIT_HTML=<file> cargo test renders_a_frame_as_html` writes the frame with its colours, for a screenshot.
+    #[test]
+    fn renders_a_frame_as_html() {
+        let mut app = app();
+        let (width, height) = (96u16, 26u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let css = |color: Color, default: &str| match color {
+            Color::Yellow => "#e5c07b".to_string(),
+            Color::Green => "#98c379".to_string(),
+            Color::Cyan => "#56b6c2".to_string(),
+            Color::Red => "#e06c75".to_string(),
+            Color::DarkGray => "#7f848e".to_string(),
+            Color::Rgb(r, g, b) => format!("rgb({r},{g},{b})"),
+            _ => default.to_string(),
+        };
+        let mut html = String::from("<pre style=\"background:#16161e;color:#d7dae0;font:15px/1.45 'DejaVu Sans Mono',Menlo,monospace;padding:18px 22px;margin:0;display:inline-block\">");
+        for y in 0..height {
+            for x in 0..width {
+                let cell = &buffer[(x, y)];
+                let (mut fg, mut bg) = (css(cell.fg, "#d7dae0"), "transparent".to_string());
+                if cell.modifier.contains(Modifier::REVERSED) {
+                    bg = "#3b3f51".to_string();
+                    fg = css(cell.fg, "#ffffff");
+                }
+                let weight = if cell.modifier.contains(Modifier::BOLD) { "bold" } else { "normal" };
+                let symbol = cell.symbol().replace('&', "&amp;").replace('<', "&lt;");
+                html.push_str(&format!(
+                    "<span style=\"color:{fg};background:{bg};font-weight:{weight}\">{symbol}</span>"
+                ));
+            }
+            html.push('\n');
+        }
+        html.push_str("</pre>");
+        assert!(html.matches("<span").count() == (width as usize) * (height as usize));
+        if let Some(path) = std::env::var_os("COCKPIT_HTML") {
+            std::fs::write(path, html).unwrap();
+        }
+    }
+
     #[test]
     fn a_stopped_daemon_is_said_plainly() {
         let mut app = App::new("work");

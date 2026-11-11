@@ -49,6 +49,8 @@ herdr-superagent retitle <id> "…"                  # the workspace and record 
 herdr-superagent stop-ticket <id> | retry <id>
 ```
 
+![The cockpit: what needs you first, the selected ticket's checkpoint below, the keys that apply](docs/img/cockpit.png)
+
 All of these are also keys in the cockpit (`a`, `c`, `n`, `t`, `s`, `r`,
 `o` opens the ticket's pane), with the mouse working as in herdr.
 
