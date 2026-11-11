@@ -409,7 +409,16 @@ pub fn consider(harness: &str, path: &Path, known_mark: Option<&str>, options: &
     if !inside && !options.all {
         return Outcome::Skip(Skip::Outside);
     }
+    // A session's directory may be gone (a removed worktree, a deleted subfolder): it then
+    // belongs to the profile repository that contained it, not to a project named after the folder.
+    let containing = options
+        .repos
+        .iter()
+        .filter(|repo| cwd.starts_with(repo))
+        .max_by_key(|repo| repo.len())
+        .and_then(|repo| crate::memory::project_key(repo));
     let project = crate::memory::project_key(&session.cwd)
+        .or(containing)
         .or_else(|| cwd.file_name().and_then(|n| n.to_str()).map(str::to_string))
         .unwrap_or_else(|| crate::memory::NOTES_PROJECT.to_string());
     if options.project.map(|p| p != project).unwrap_or(false) {
@@ -539,6 +548,26 @@ mod tests {
         ));
         let pi = home.path().join(".pi/agent/sessions/web/p.jsonl");
         assert!(matches!(consider("pi", &pi, None, &options), Outcome::Skip(Skip::Outside)));
+        // A session in a folder that no longer exists, inside a repository that does.
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let gone = dir.join("gone.jsonl");
+        std::fs::write(
+            &gone,
+            CLAUDE.replace("/src/api", &repo.join("removed-worktree").display().to_string()),
+        )
+        .unwrap();
+        let inside = vec![repo.display().to_string()];
+        let within = Options {
+            repos: &inside,
+            all: false,
+            project: None,
+            since_days: None,
+        };
+        match consider("claude", &gone, None, &within) {
+            Outcome::Import(entry, _) => assert_eq!(entry.project, "repo", "keyed by the repository that held it"),
+            Outcome::Skip(skip) => panic!("skipped: {skip:?}"),
+        }
         let everything = Options { all: true, ..options };
         assert!(matches!(consider("pi", &pi, None, &everything), Outcome::Import(..)));
     }

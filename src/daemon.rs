@@ -381,6 +381,9 @@ impl Daemon {
 
     #[cfg(unix)]
     fn handle_connection(&self, stream: std::os::unix::net::UnixStream) {
+        // On macOS an accepted connection inherits the listener's non-blocking mode: a request
+        // larger than one socket buffer (a memory import) then fails mid-read.
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         let mut reader = BufReader::new(match stream.try_clone() {
