@@ -55,7 +55,7 @@ pub enum Skip {
 
 /// Bumped when what an entry holds changes: marks from an older version do not count,
 /// and the entries they made are replaced.
-pub const VERSION: &str = "v2";
+pub const VERSION: &str = "v3";
 
 fn text_of(value: &Value, key: &str) -> Option<String> {
     [
@@ -164,12 +164,18 @@ fn injected(text: &str) -> bool {
 /// own: every leading paragraph that starts with one of `prefixes` goes, as does a whole
 /// message that is nothing else.
 pub fn strip_hooks(text: &str, prefixes: &[String]) -> String {
+    // Compared character by character: a byte offset can land inside a multi-byte character.
+    let starts_with = |text: &str, prefix: &str| {
+        let mut chars = text.chars();
+        prefix.chars().all(|p| chars.next().is_some_and(|c| c.eq_ignore_ascii_case(&p)))
+    };
     let mut rest = text.trim_start();
     loop {
         let hit = prefixes
             .iter()
-            .filter(|p| !p.trim().is_empty())
-            .any(|p| rest.len() >= p.len() && rest[..p.len().min(rest.len())].eq_ignore_ascii_case(p));
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .any(|p| starts_with(rest, p));
         if !hit {
             return rest.to_string();
         }
@@ -180,12 +186,36 @@ pub fn strip_hooks(text: &str, prefixes: &[String]) -> String {
     }
 }
 
+/// The first line of a prompt that still says something once secrets are masked.
+fn telling_line(text: &str) -> Option<String> {
+    text.lines().map(|line| crate::memory::redact(line.trim())).find(|line| {
+        let words = line
+            .split_whitespace()
+            .filter(|w| !w.contains("[redacted]") && w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+            .count();
+        words >= 2
+    })
+}
+
 /// A session that is not the person's work: a prompt written for an agent, or a probe.
 fn probe(asked: &[String], last_answer: &str, changed_files: bool) -> bool {
     let first = asked.first().map(|a| a.trim()).unwrap_or("");
     let lower = first.to_lowercase();
     if lower.starts_with("you are ") || lower.starts_with("your task is ") || lower.starts_with("you're a ") {
         return true;
+    }
+    // A prompt that opens with a markdown heading was assembled by a pipeline, not typed.
+    if first.starts_with("# ") || first.starts_with("## ") {
+        return true;
+    }
+    // Nothing left to title it by ("sss", a pasted token, a bare command echo).
+    let telling = telling_line(first);
+    if telling
+        .as_ref()
+        .map(|t| t.split_whitespace().count() < 3 && t.chars().count() < 16)
+        .unwrap_or(true)
+    {
+        return !changed_files || telling.is_none();
     }
     let words: usize = asked.iter().map(|a| a.split_whitespace().count()).sum();
     // "hi", "say only: one", "Reply with exactly one word: ack": a few words in, a few words out.
@@ -380,7 +410,7 @@ pub fn entry(session: &Session, project: &str) -> MemoryEntry {
             "{} session{}: {}",
             session.harness,
             if date.is_empty() { String::new() } else { format!(" {date}") },
-            first_line(&goal, 90)
+            clip(&telling_line(&goal).unwrap_or_else(|| first_line(&goal, 90)), 90)
         ),
         body,
         created_at: if session.started.is_empty() {
@@ -465,8 +495,10 @@ pub fn opening(harness: &str, path: &Path) -> Option<String> {
     if rest.trim().is_empty() {
         return None;
     }
-    let head: String = head.lines().next().unwrap_or("").chars().take(40).collect();
-    (head.trim().chars().count() >= 12).then(|| head.trim().to_string())
+    // The whole paragraph, word for word: a hook repeats itself exactly, while your own
+    // habitual opener ("Read-only audit in …") goes on differently each time.
+    let head: String = head.trim().chars().take(2000).collect();
+    (head.chars().count() >= 12).then_some(head)
 }
 
 /// What a run decided about one file.
@@ -668,6 +700,41 @@ mod tests {
         assert!(entry(&session, "acme/dbt")
             .title
             .ends_with("Why does the nightly dbt run time out on the orders model?"));
+        // Cutting by bytes inside a multi-byte character used to panic here.
+        assert_eq!(
+            strip_hooks(
+                "Read — only audit of the orders model",
+                &["Read — only audit in the billing".to_string()]
+            ),
+            "Read — only audit of the orders model"
+        );
+        assert_eq!(strip_hooks("é", &["CAVEMAN MODE ACTIVE".to_string()]), "é");
+        // Nothing to title it by, a pipeline's assembled prompt: not the person's work.
+        for ask in [
+            "sss",
+            "Ran pwd",
+            "## Previous step output\n\nthe plan so far, in many words, for the next step",
+            "sk-abc123def456ghi789jkl012mno345pqr678",
+        ] {
+            let text = exchange(
+                ask,
+                "A long answer that explains several things about the repository and what could be done next in it.",
+            );
+            assert_eq!(parse("claude", Path::new("/x/p.jsonl"), &text).unwrap_err(), Skip::Probe, "{ask}");
+        }
+        // A first line that is only a secret does not become the title.
+        let secret_first = exchange(
+            "sk-abc123def456ghi789jkl012mno345pqr678\nUse this key to check why the billing export fails for tenant 12",
+            "The export fails because the tenant has no default currency; set one or pass --currency.",
+        );
+        let titled = entry(&parse("claude", Path::new("/x/k.jsonl"), &secret_first).unwrap(), "acme/api");
+        assert!(
+            titled
+                .title
+                .ends_with("Use this key to check why the billing export fails for tenant 12"),
+            "{}",
+            titled.title
+        );
         let only_hook = exchange(
             "caveman mode active. Respond terse.",
             "ok, terse mode on for this whole session now and later",

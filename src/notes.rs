@@ -15,6 +15,9 @@ use crate::daemon::Daemon;
 use crate::memory::MemoryEntry;
 use crate::profile::NotesSource;
 
+/// Bumped when what a note's entry holds changes, so notes are read again.
+const NOTES_VERSION: &str = "n2";
+
 /// The note files of a source: `<path>/*.md`, or `<path>/notes/*.md` when that folder exists.
 pub fn files(path: &Path) -> Vec<PathBuf> {
     let dir = if path.join("notes").is_dir() {
@@ -61,24 +64,9 @@ pub fn entry(file: &Path, text: &str, project: &str) -> Option<MemoryEntry> {
     let title = field("description")
         .or_else(|| field("name"))
         .unwrap_or_else(|| stem.replace(['-', '_'], " "));
-    let mut body = body.to_string();
-    let kind = field("type");
-    // Where the fact came from stays with it: the frontmatter's remaining lines, as written.
-    let origin: Vec<&str> = front
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter(|l| !["name:", "description:", "type:"].iter().any(|k| l.starts_with(k)))
-        .collect();
-    body.push_str(&format!(
-        "\n\n- note: {stem}{}\n",
-        kind.as_ref().map(|k| format!(" ({k})")).unwrap_or_default()
-    ));
-    if !origin.is_empty() {
-        body.push_str(&format!(
-            "- from: {}\n",
-            origin.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
-        ));
-    }
+    // Only the note's own text is indexed: frontmatter in the body showed up in search snippets.
+    let body = body.to_string();
+    let kind = field("type").unwrap_or_default();
     let created_at = std::fs::metadata(file)
         .and_then(|m| m.modified())
         .ok()
@@ -89,7 +77,7 @@ pub fn entry(file: &Path, text: &str, project: &str) -> Option<MemoryEntry> {
         project: project.to_string(),
         ticket_id: None,
         assignment_id: None,
-        role: "note".into(),
+        role: if kind.is_empty() { "note".into() } else { format!("note-{kind}") },
         title,
         body,
         created_at,
@@ -124,7 +112,7 @@ impl Daemon {
                 let Some((mark, _, _)) = crate::importer::mark(&file) else {
                     continue;
                 };
-                if self.store.kv_get(&key).as_deref() == Some(&format!("{mark}|{project}")) {
+                if self.store.kv_get(&key).as_deref() == Some(&format!("{mark}|{project}|{NOTES_VERSION}")) {
                     unchanged += 1;
                     continue;
                 }
@@ -135,7 +123,7 @@ impl Daemon {
                         if let Some(repo) = self.state_repo.borrow().as_ref() {
                             let _ = repo.write_curated(&entry);
                         }
-                        self.store.kv_set(&key, &format!("{mark}|{project}"));
+                        self.store.kv_set(&key, &format!("{mark}|{project}|{NOTES_VERSION}"));
                         added += 1;
                     }
                     Err(e) => problems.push(format!("{}: {e}", file.display())),
@@ -198,9 +186,11 @@ mod tests {
 
         let made = entry(&found[0], note, "acme/dbt").unwrap();
         assert_eq!(made.title, "The orders model must be incremental on updated_at");
-        assert_eq!(made.role, "note");
-        assert!(made.body.starts_with("Full refresh scans 400 GB"));
-        assert!(made.body.contains("- note: orders-incremental (decision)") && made.body.contains("- from: sessions: [a1, b2]"));
+        assert_eq!(made.role, "note-decision");
+        assert_eq!(
+            made.body, "Full refresh scans 400 GB and times out after 2 h.",
+            "the body only, no frontmatter"
+        );
         assert_eq!(
             made.id,
             entry(&found[0], "---\nname: x\n---\nedited", "acme/dbt").unwrap().id,

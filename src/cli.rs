@@ -663,7 +663,10 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                 lines.push(format!("  replaced {replaced} entries an older importer made"));
             }
             for head in &detected {
-                lines.push(format!("  dropped a hook preamble that opened several sessions: \"{head}…\""));
+                let shown: String = head.lines().next().unwrap_or("").chars().take(60).collect();
+                lines.push(format!(
+                    "  dropped a hook preamble that opened several sessions word for word: \"{shown}…\""
+                ));
             }
             let why = |key: &str| match key {
                 "probe" => "agent prompts and probes (\"You are a … subagent\", \"hi\")",
