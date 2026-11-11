@@ -13,8 +13,17 @@ use crate::daemon::Daemon;
 use crate::executor::Outcome;
 use crate::store::sqlite::Effect;
 
-/// A candidate younger than this is probably being routed by the session that submitted it.
-const CANDIDATE_GRACE_MS: i64 = 20_000;
+/// A request the person typed is submitted by the session itself, which routes it in the
+/// same turn; it is only announced when that has not happened after this long. Requests
+/// from elsewhere (a source, a shell) are announced at once.
+const CANDIDATE_GRACE_MS: i64 = 90_000;
+
+fn candidate_grace_ms() -> i64 {
+    std::env::var("HERDR_SUPERAGENT_ROUTING_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CANDIDATE_GRACE_MS)
+}
 /// An ended ticket is announced only when it ended this recently (not history on a first run).
 const ENDED_WINDOW_MS: i64 = 10 * 60_000;
 const PREFIX: &str = "[superagent daemon]";
@@ -147,7 +156,10 @@ impl Daemon {
             .store
             .eval_list()
             .into_iter()
-            .filter(|e| e.paused_at.is_none() && clock::millis_between(&e.started_at, &now) >= CANDIDATE_GRACE_MS)
+            .filter(|e| {
+                let own = self.store.request_get(&e.request_id).map(|r| r.source == "you").unwrap_or(true);
+                e.paused_at.is_none() && (!own || clock::millis_between(&e.started_at, &now) >= candidate_grace_ms())
+            })
             .filter(|e| self.store.kv_get(&format!("told.eval.{}.{}", e.id, e.expired)).is_none())
             .map(|e| {
                 self.store.kv_set(&format!("told.eval.{}.{}", e.id, e.expired), &now);

@@ -131,6 +131,7 @@ impl World {
             .env("HERDR_SUPERAGENT_STATE_DIR", self.dir.path().join("state"))
             .env("HERDR_SUPERAGENT_CONFIG_DIR", self.dir.path().join("config"))
             .env("HOME", self.dir.path().join("home"))
+            .env("HERDR_SUPERAGENT_ROUTING_GRACE_MS", "1000")
             .env_remove("HERDR_PANE_ID")
             .env_remove("SUPERAGENT_TICKET")
             .env_remove("SUPERAGENT_ASSIGNMENT")
