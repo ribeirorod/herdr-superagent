@@ -63,10 +63,15 @@ impl Paths {
         if preferred.as_os_str().len() < 90 {
             return preferred;
         }
+        // Named after the state directory too: two state roots with a profile of the
+        // same name must not meet on one socket.
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.state_dir().as_os_str().as_encoded_bytes());
+        let tag: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
         let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
         PathBuf::from("/tmp")
             .join(format!("herdr-sa-{user}"))
-            .join(format!("{}.sock", self.profile))
+            .join(format!("{}-{tag}.sock", self.profile))
     }
     pub fn daemon_info_path(&self) -> PathBuf {
         self.state_dir().join("daemon.json")
@@ -129,6 +134,14 @@ mod tests {
             state_root: PathBuf::from("/s".repeat(60)),
         };
         assert!(long.socket_path().as_os_str().len() < 90);
-        assert!(long.socket_path().ends_with("work.sock"));
+        let name = long.socket_path().file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("work-") && name.ends_with(".sock"), "{name}");
+        // Another state root with a profile of the same name gets another socket.
+        let other = Paths {
+            profile: "work".into(),
+            config_root: PathBuf::from("/c"),
+            state_root: PathBuf::from("/t".repeat(60)),
+        };
+        assert_ne!(other.socket_path(), long.socket_path());
     }
 }

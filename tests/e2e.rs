@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-superagent");
+/// Long on purpose: the daemon's socket then takes its short fallback path, as it does
+/// under macOS's temp directory, and tests running side by side must not meet there.
+const STATE: &str = "state-directory-with-a-deliberately-long-name-so-the-daemon-socket-falls-back-to-its-short-path";
 
 #[derive(Default)]
 struct Fake {
@@ -128,7 +131,7 @@ impl World {
         let mut command = Command::new(BIN);
         command
             .env("HERDR_SOCKET_PATH", &self.herdr_socket)
-            .env("HERDR_SUPERAGENT_STATE_DIR", self.dir.path().join("state"))
+            .env("HERDR_SUPERAGENT_STATE_DIR", self.dir.path().join(STATE))
             .env("HERDR_SUPERAGENT_CONFIG_DIR", self.dir.path().join("config"))
             .env("HOME", self.dir.path().join("home"))
             .env("HERDR_SUPERAGENT_ROUTING_GRACE_MS", "1000")
@@ -160,7 +163,7 @@ impl World {
     /// One request on the daemon's own socket, for what the CLI does through `start`.
     fn ipc(&self, method: &str, params: Value) -> Value {
         let info: Value =
-            serde_json::from_str(&std::fs::read_to_string(self.dir.path().join("state/profiles/e2e/daemon.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(self.dir.path().join(STATE).join("profiles/e2e/daemon.json")).unwrap()).unwrap();
         let mut stream = UnixStream::connect(info["socket"].as_str().unwrap()).unwrap();
         stream
             .write_all(format!("{}\n", json!({ "id": 1, "method": method, "params": params })).as_bytes())
@@ -538,7 +541,7 @@ fn an_autonomous_worker_is_held_at_a_risky_command_until_a_person_approves_it() 
     });
     assert_eq!(ticket["mode"], "autonomous");
     let worktree = ticket["execution"]["directory"].as_str().unwrap().to_string();
-    let shims = world.dir.path().join("state/profiles/e2e/shims");
+    let shims = world.dir.path().join(STATE).join("profiles/e2e/shims");
     // The worker's shell has the shims first on PATH, as the daemon exported them.
     let exported = world
         .calls("pane.send_input")
@@ -557,7 +560,7 @@ fn an_autonomous_worker_is_held_at_a_risky_command_until_a_person_approves_it() 
             .env("SUPERAGENT_TICKET", &ticket_id)
             .env("SUPERAGENT_WORKTREE", &worktree)
             .env("SUPERAGENT_PROFILE", "e2e")
-            .env("HERDR_SUPERAGENT_STATE_DIR", world.dir.path().join("state"))
+            .env("HERDR_SUPERAGENT_STATE_DIR", world.dir.path().join(STATE))
             .env("HERDR_SUPERAGENT_CONFIG_DIR", world.dir.path().join("config"))
             .env("HERDR_SOCKET_PATH", &world.herdr_socket)
             .output()
