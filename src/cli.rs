@@ -272,7 +272,7 @@ pub enum ProfileAction {
     /// Set keys: `superagent.model=opus repos[+].path=~/work/api modes.cap=checkpoint`.
     Set {
         assignments: Vec<String>,
-        /// Confirm a change to a protected key (modes, repos, limits, routing).
+        /// Confirm a change to a protected key (modes, limits, routing).
         #[arg(long)]
         yes: bool,
         /// Show the diff and the mode replay without saving.

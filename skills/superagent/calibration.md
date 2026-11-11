@@ -33,6 +33,8 @@ Then ask, in a few short questions:
    are missing.
 3. Which repositories they maintain in this context (`repos[+].path`,
    `repos[n].default_branch`, `repos[n].notes`). Verify each path exists.
+   Show the person the list; once they approve it, write it yourself with
+   `herdr-superagent --profile {profile_name} profile set 'repos[+].path=…' …`.
 
 ## Step 2: preferences
 
@@ -56,7 +58,7 @@ autonomously (research? scratch repos?). Those become
 `modes.rules=[{ match = { workflow = "research" }, mode = "autonomous" }]`.
 Ask how many workers may run at once (`limits.max_workers`, propose 3).
 
-**You cannot change `modes`, `repos`, `limits` or `routing` yourself.** Those
+**You cannot change `modes`, `limits` or `routing` yourself.** Those
 affect how much review a request gets. Print the exact
 `herdr-superagent --profile {profile_name} profile set … --yes` command for the person to run in their
 own shell, and wait until `herdr-superagent profile` shows the change.

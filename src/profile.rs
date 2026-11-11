@@ -340,7 +340,7 @@ impl Default for StateRepo {
 
 /// Keys only you may change, from your own shell with `--yes`: everything
 /// that affects which mode a request resolves to.
-pub const PROTECTED_PREFIXES: &[&str] = &["modes", "repos", "limits", "routing", "sources"];
+pub const PROTECTED_PREFIXES: &[&str] = &["modes", "limits", "routing", "sources"];
 
 impl Profile {
     pub fn new(id: &str) -> Profile {
@@ -959,7 +959,7 @@ mod tests {
         assert_eq!(profile.models.hard.use_[1].model, "gpt-5");
         assert_eq!(Profile::default().models.small.use_[0].model, "haiku");
         assert!(profile.calibrated);
-        assert!(assignments[1].protected() && assignments[2].protected() && !assignments[0].protected());
+        assert!(assignments[1].protected() && !assignments[2].protected() && !assignments[0].protected());
         assert!(apply(&text, &[Assignment::parse("limits.max_workers=0").unwrap()])
             .unwrap_err()
             .contains("max_workers"));
