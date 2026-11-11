@@ -1005,7 +1005,28 @@ mod tests {
             },
         ];
         assert_eq!(pick_tier(&profile, "worker", ""), ("sh".into(), "fast".into()));
-        assert_eq!(pick_tier(&profile, "reviewer", "").1, "sonnet", "the default review tier");
+        // Nothing here may depend on which harnesses the machine running the tests has.
+        profile.models.review.use_ = vec![crate::profile::HarnessModel {
+            harness: "sh".into(),
+            model: "careful".into(),
+        }];
+        assert_eq!(
+            pick_tier(&profile, "reviewer", "").1,
+            "careful",
+            "a reviewer runs on the review tier"
+        );
+        assert_eq!(
+            pick_tier(&profile, "worker", "review").1,
+            "careful",
+            "the pack's tier for a role wins"
+        );
+        assert_eq!(pick_tier(&profile, "reviewer", "hard").1, "fast");
+        profile.models.review.use_[0].harness = "definitely-missing-harness".into();
+        assert_eq!(
+            pick_tier(&profile, "reviewer", ""),
+            (profile.superagent.harness.clone(), String::new()),
+            "no installed harness in the tier: the session's own, with its default model"
+        );
         assert_eq!(
             mode_flags(&profile, "claude", Mode::Autonomous),
             vec!["--dangerously-skip-permissions"]
