@@ -26,6 +26,7 @@ mod packs;
 mod paths;
 mod profile;
 mod session;
+mod sources;
 mod staterepo;
 mod store;
 

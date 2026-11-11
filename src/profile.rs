@@ -30,6 +30,58 @@ pub struct Profile {
     pub memory: Memory,
     pub state_repo: StateRepo,
     pub harness_flags: HarnessFlags,
+    /// Where work arrives from besides the person typing (issues, pull requests, mail).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<Source>,
+}
+
+/// One place requests come from, polled on its own interval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Source {
+    pub id: String,
+    /// `github` (the `gh` CLI), `command` (a program printing JSON items) or
+    /// `session` (the superagent session looks through its MCP servers).
+    pub kind: String,
+    pub enabled: bool,
+    pub every_minutes: u64,
+    /// github: `owner/name`; empty means the repository in `project`.
+    pub repo: String,
+    /// github: `issues` or `prs`.
+    pub what: String,
+    /// github: a search such as `assignee:@me label:bug`.
+    pub query: String,
+    pub limit: u32,
+    /// command: the program and its arguments.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// session: what to look for, in words ("Jira issues assigned to me in project API").
+    pub instructions: String,
+    /// The repository items of this source are about.
+    pub project: String,
+    /// The workflow and mode routing should prefer for this source's items.
+    pub workflow: String,
+    pub mode: String,
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Source {
+            id: String::new(),
+            kind: "session".into(),
+            enabled: true,
+            every_minutes: 15,
+            repo: String::new(),
+            what: "issues".into(),
+            query: String::new(),
+            limit: 20,
+            command: Vec::new(),
+            instructions: String::new(),
+            project: String::new(),
+            workflow: String::new(),
+            mode: String::new(),
+        }
+    }
 }
 
 /// Flags that turn a harness's own permission prompts off, per mode (PLAN §6).
@@ -274,7 +326,7 @@ impl Default for StateRepo {
 
 /// Keys only you may change, from your own shell with `--yes`: everything
 /// that affects which mode a request resolves to.
-pub const PROTECTED_PREFIXES: &[&str] = &["modes", "repos", "limits", "routing"];
+pub const PROTECTED_PREFIXES: &[&str] = &["modes", "repos", "limits", "routing", "sources"];
 
 impl Profile {
     pub fn new(id: &str) -> Profile {
@@ -339,6 +391,39 @@ impl Profile {
         for repo in &self.repos {
             if repo.path.trim().is_empty() {
                 return Err("every [[repos]] entry needs a path".into());
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &self.sources {
+            if source.id.trim().is_empty()
+                || !source.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                || source.id == "you"
+            {
+                return Err(format!(
+                    "every [[sources]] entry needs an id of letters, digits, - and _ (got '{}')",
+                    source.id
+                ));
+            }
+            if !seen.insert(source.id.clone()) {
+                return Err(format!("source id '{}' is used twice", source.id));
+            }
+            if !["github", "command", "session"].contains(&source.kind.as_str()) {
+                return Err(format!(
+                    "sources.{}: kind must be github, command or session, not '{}'",
+                    source.id, source.kind
+                ));
+            }
+            if source.kind == "command" && source.command.is_empty() {
+                return Err(format!(
+                    "sources.{}: kind command needs `command = [\"program\", \"arg\", …]`",
+                    source.id
+                ));
+            }
+            if source.kind == "session" && source.instructions.trim().is_empty() {
+                return Err(format!(
+                    "sources.{}: kind session needs `instructions` saying what to look for",
+                    source.id
+                ));
             }
         }
         Ok(())

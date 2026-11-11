@@ -104,6 +104,11 @@ pub(crate) struct Daemon {
     pub(crate) last_commit: Cell<Instant>,
     pub(crate) last_renew: Cell<Instant>,
     pub(crate) last_tidy: Cell<Instant>,
+    /// Finished source polls come back here from their threads.
+    pub(crate) polled: (
+        std::sync::mpsc::Sender<crate::sources::Polled>,
+        std::sync::mpsc::Receiver<crate::sources::Polled>,
+    ),
     pub(crate) needs_you_seen: Cell<usize>,
     pub(crate) profile_mtime: Cell<Option<std::time::SystemTime>>,
     /// What the observer last saw of each worker pane.
@@ -197,6 +202,7 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         last_commit: Cell::new(Instant::now()),
         last_renew: Cell::new(Instant::now()),
         last_tidy: Cell::new(Instant::now()),
+        polled: std::sync::mpsc::channel(),
         needs_you_seen: Cell::new(0),
         profile_mtime: Cell::new(profile_mtime),
         workers: RefCell::new(HashMap::new()),
@@ -415,6 +421,12 @@ impl Daemon {
             tracing::warn!(%e, "evaluate_due failed");
         }
         self.route_unrouted();
+        if !self.policy.paused() {
+            self.poll_sources(&self.polled.0, None);
+        }
+        while let Ok(polled) = self.polled.1.try_recv() {
+            self.sources_polled(polled);
+        }
         self.drain_effects();
         self.observe_workers();
         self.announce();
@@ -703,12 +715,65 @@ impl Daemon {
                 str_param(params, "name")?,
                 params.get("summary").and_then(Value::as_str).unwrap_or(""),
             )?)),
-            "approve" => Ok(ticket_view(
-                &self.engine.approve(str_param(params, "ticket")?, opt_param(params, "comment"))?,
-            )),
+            "approve" => {
+                let ticket_id = str_param(params, "ticket")?;
+                let waiting = self.store.ticket_get(ticket_id).and_then(|t| t.checkpoint.map(|c| c.name));
+                let ticket = self.engine.approve(ticket_id, opt_param(params, "comment"))?;
+                // An approved guard checkpoint lets exactly the command it held back through, once.
+                if waiting.map(|name| name.starts_with("guard-")).unwrap_or(false) {
+                    if let Some(held) = self.store.kv_get(&format!("guard.held.{ticket_id}")).filter(|c| !c.is_empty()) {
+                        self.store.kv_set(&format!("guard.permit.{ticket_id}"), &held);
+                    }
+                }
+                self.store.kv_set(&format!("guard.held.{ticket_id}"), "");
+                Ok(ticket_view(&ticket))
+            }
+            "guard_hold" => {
+                let ticket_id = str_param(params, "ticket")?;
+                let command = str_param(params, "command")?;
+                let name = format!("guard-{}", str_param(params, "tool")?);
+                let summary = format!(
+                    "guard held back `{command}`: {}. Approve to let the worker run exactly this command once.",
+                    params.get("reason").and_then(Value::as_str).unwrap_or("risky")
+                );
+                let ticket = match opt_param(params, "assignment") {
+                    Some(assignment) => self.engine.checkpoint_as(ticket_id, &assignment, &name, &summary),
+                    None => self.engine.checkpoint(ticket_id, &name, &summary),
+                }?;
+                self.store.kv_set(&format!("guard.held.{ticket_id}"), command);
+                Ok(ticket_view(&ticket))
+            }
+            "guard_permit" => {
+                let ticket_id = str_param(params, "ticket")?;
+                let key = format!("guard.permit.{ticket_id}");
+                let permitted = self.store.kv_get(&key).as_deref() == Some(str_param(params, "command")?);
+                if permitted {
+                    self.store.kv_set(&key, "");
+                }
+                Ok(json!({ "permitted": permitted }))
+            }
             "stop_ticket" => Ok(ticket_view(
                 &self.engine.stop_ticket(str_param(params, "ticket")?, opt_param(params, "reason"))?,
             )),
+            "sources" => Ok(self.sources_view()),
+            "sources_poll" => {
+                let only = opt_param(params, "id");
+                if let Some(id) = &only {
+                    if !self.policy.snapshot().sources.iter().any(|s| &s.id == id) {
+                        return Err(UserError::internal(format!("no source '{id}' in the profile")));
+                    }
+                }
+                let mut started = Vec::new();
+                match &only {
+                    Some(id) => started.extend(self.poll_sources(&self.polled.0, Some(id))),
+                    None => {
+                        for source in self.policy.snapshot().sources.iter().filter(|s| s.enabled) {
+                            started.extend(self.poll_sources(&self.polled.0, Some(&source.id)));
+                        }
+                    }
+                }
+                Ok(json!({ "polling": started }))
+            }
             "request_changes" => Ok(ticket_view(
                 &self
                     .engine
@@ -911,7 +976,9 @@ impl Daemon {
         let request = Request {
             id: id.clone(),
             source: opt_param(params, "source").unwrap_or_else(|| "you".into()),
-            actor: opt_param(params, "actor").unwrap_or_else(|| "you".into()),
+            actor: opt_param(params, "actor")
+                .or_else(|| opt_param(params, "source"))
+                .unwrap_or_else(|| "you".into()),
             human: params.get("human").and_then(Value::as_bool).unwrap_or(true),
             at: now,
             text: text.clone(),

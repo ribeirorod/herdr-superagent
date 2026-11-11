@@ -81,6 +81,11 @@ pub enum Command {
     Candidates,
     /// Route a candidate: accept it into a ticket, attach it to one, stop one, or ignore it.
     Route(RouteArgs),
+    /// Where work arrives from (issues, pull requests, mail): list the profile's sources, or poll now.
+    Sources {
+        #[command(subcommand)]
+        action: Option<SourcesAction>,
+    },
     /// The workflows a request can be routed to, from the built-in and the profile's packs.
     Packs {
         /// Show one workflow's steps: `feature`, `software-dev/bugfix`, …
@@ -276,6 +281,15 @@ pub struct SubmitArgs {
     /// A stable id, so a repeated submit is a no-op.
     #[arg(long)]
     pub id: Option<String>,
+    /// The profile source this item came from (issues, mail); such a request always goes through routing.
+    #[arg(long)]
+    pub source: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SourcesAction {
+    /// Poll one source, or all of them, now.
+    Poll { id: Option<String> },
 }
 
 #[derive(Args, Debug)]
@@ -541,7 +555,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             let meta = args.base.as_ref().map(|b| json!({ "base": b })).unwrap_or(Value::Null);
             let result = daemon(
                 "submit",
-                json!({ "text": args.text, "workflow": args.workflow, "mode": args.mode, "project": args.project, "id": args.id, "meta": meta }),
+                json!({ "text": args.text.replace("\\n", "\n"), "workflow": args.workflow, "mode": args.mode, "project": args.project, "id": args.id, "meta": meta, "source": args.source }),
             )?;
             let text = match result.get("ticket_id").and_then(Value::as_str) {
                 Some(ticket) => format!("ticket {ticket} created (request {})", result["request_id"].as_str().unwrap_or("")),
@@ -564,12 +578,33 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                         items
                             .iter()
                             .map(|c| {
-                                format!(
+                                let request = &c["request"];
+                                let mut line = format!(
                                     "{}  [{}]  {}",
-                                    c["request"]["id"].as_str().unwrap_or(""),
+                                    request["id"].as_str().unwrap_or(""),
                                     c["strength"].as_str().unwrap_or(""),
-                                    first_line(c["request"]["text"].as_str().unwrap_or(""))
-                                )
+                                    first_line(request["text"].as_str().unwrap_or(""))
+                                );
+                                if let Some(project) = request["project"].as_str() {
+                                    line.push_str(&format!("\n    project: {project}"));
+                                }
+                                // An item from a source: who sent it, and how to admit it.
+                                if let Some(rule) = request["meta"]["rule"].as_str() {
+                                    line.push_str(&format!(
+                                        "\n    from source `{}` by {} · accept with --rule {rule}",
+                                        request["source"].as_str().unwrap_or(""),
+                                        request["actor"].as_str().unwrap_or("")
+                                    ));
+                                    let hint = request["meta"]["workflow_hint"].as_str().unwrap_or("");
+                                    if !hint.is_empty() {
+                                        line.push_str(&format!(" --workflow {hint}"));
+                                    }
+                                    let mode = request["meta"]["mode_hint"].as_str().unwrap_or("");
+                                    if !mode.is_empty() {
+                                        line.push_str(&format!(" --mode {mode}"));
+                                    }
+                                }
+                                line
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -606,6 +641,43 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                 decision["ticket_id"].as_str().map(|t| format!(" ticket {t}")).unwrap_or_default()
             );
             out(decision, text)
+        }
+        Command::Sources { action: None } => {
+            let list = daemon("sources", json!({}))?;
+            let text = match list.as_array().filter(|a| !a.is_empty()) {
+                None => "no sources in the profile; add one with `profile set 'sources[+]={ id = \"issues\", kind = \"github\", repo = \"owner/name\", query = \"assignee:@me\", project = \"~/src/name\" }' --yes`".to_string(),
+                Some(items) => items
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{:<14} {:<8} every {:>3} min  {}\n{:<14} via {}\n{:<14} {}",
+                            s["id"].as_str().unwrap_or(""),
+                            s["kind"].as_str().unwrap_or(""),
+                            s["every_minutes"],
+                            if s["enabled"].as_bool().unwrap_or(true) { "" } else { "(disabled)" },
+                            "",
+                            s["via"].as_str().unwrap_or(""),
+                            "",
+                            s["status"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            out(list, text)
+        }
+        Command::Sources {
+            action: Some(SourcesAction::Poll { id }),
+        } => {
+            let value = daemon("sources_poll", json!({ "id": id }))?;
+            let text = format!(
+                "polling {}; new items show up in `candidates`",
+                value["polling"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default()
+            );
+            out(value, text)
         }
         Command::Packs { workflow } => {
             let (packs, problems) = crate::packs::load(&paths.profile_dir());
@@ -1079,6 +1151,10 @@ fn action(profile: &str, paths: &Paths) -> Result<i32, String> {
 fn guard(paths: &Paths, tool: &str, args: &[String]) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
     let shims = paths.state_dir().join("shims");
+    // Everything below, and the real tool once it runs, must see PATH without the shims:
+    // the guard's own `git` calls would otherwise be the shim again, without end.
+    let clean = crate::guard::path_without(&shims);
+    std::env::set_var("PATH", &clean);
     let real = crate::guard::real_tool(tool, &shims).ok_or_else(|| format!("guard: {tool} not found on PATH"))?;
     let ticket = std::env::var("SUPERAGENT_TICKET").ok().filter(|t| !t.is_empty());
     let worktree = std::env::var("SUPERAGENT_WORKTREE")
@@ -1088,18 +1164,24 @@ fn guard(paths: &Paths, tool: &str, args: &[String]) -> Result<i32, String> {
     let default = crate::guard::default_branch(worktree.as_deref());
     if let (Some(ticket), Some(reason)) = (&ticket, crate::guard::risk(tool, args, worktree.as_deref(), Some(&default))) {
         let command = format!("{tool} {}", args.join(" "));
-        let summary = format!("guard held back `{command}`: {reason}. Approve to let the worker run it.");
-        let result = ipc::call(
-            &paths.socket_path(),
-            "checkpoint",
-            json!({ "ticket": ticket, "name": format!("guard-{tool}"), "summary": summary, "assignment": std::env::var("SUPERAGENT_ASSIGNMENT").ok() }),
-            Duration::from_secs(10),
-        );
-        match result {
-            Ok(_) => eprintln!("superagent guard: `{command}` held back ({reason}). A checkpoint was recorded: end your turn and wait for approval, then run the command again."),
-            Err(e) => eprintln!("superagent guard: `{command}` held back ({reason}); could not record a checkpoint: {e}. Report blocked and end your turn."),
+        let call = |method: &str, params: Value| ipc::call(&paths.socket_path(), method, params, Duration::from_secs(10));
+        // A person approved exactly this command at its guard checkpoint: it runs, once.
+        let permitted = call("guard_permit", json!({ "ticket": ticket, "command": command }))
+            .ok()
+            .and_then(|v| v["permitted"].as_bool())
+            .unwrap_or(false);
+        if !permitted {
+            let held = call(
+                "guard_hold",
+                json!({ "ticket": ticket, "tool": tool, "command": command, "reason": reason, "assignment": std::env::var("SUPERAGENT_ASSIGNMENT").ok() }),
+            );
+            match held {
+                Ok(_) => eprintln!("superagent guard: `{command}` held back ({reason}). A checkpoint was recorded: end your turn and wait for approval, then run exactly the same command again."),
+                Err(e) => eprintln!("superagent guard: `{command}` held back ({reason}); could not record a checkpoint: {e}. Report blocked and end your turn."),
+            }
+            return Ok(75);
         }
-        return Ok(75);
+        eprintln!("superagent guard: `{command}` was approved; running it.");
     }
     let error = std::process::Command::new(real).args(args).exec();
     Err(format!("guard: exec {tool}: {error}"))

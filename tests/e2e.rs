@@ -463,3 +463,122 @@ fn without_a_session_the_scorer_routes_and_routing_never_skips_the_session() {
     assert_eq!(ticket["assignments"][0]["role"], "researcher");
     assert!(ticket["project"].is_null());
 }
+
+#[test]
+fn a_source_item_becomes_a_candidate_that_only_its_rule_admits() {
+    let items = r#"[{"number":12,"title":"Crash on login","body":"steps","url":"https://example.invalid/12","author":{"login":"ana"}}]"#;
+    let fixture = tempfile::tempdir().unwrap();
+    let file = fixture.path().join("items.json");
+    std::fs::write(&file, items).unwrap();
+    let profile = format!(
+        "id = \"e2e\"\ncalibrated = true\n\n[[sources]]\nid = \"issues\"\nkind = \"command\"\ncommand = [\"cat\", \"{}\"]\nworkflow = \"bugfix\"\n\n[[sources]]\nid = \"jira\"\nkind = \"session\"\ninstructions = \"Jira issues assigned to me\"\n",
+        file.display()
+    );
+    let world = world(&profile);
+    let session_pane = world.fake.lock().unwrap().pane("w-cockpit", "t-cockpit");
+    world.fake.lock().unwrap().panes.last_mut().unwrap()["agent"] = json!("claude");
+    world.ipc("session_set", json!({ "pane_id": session_pane, "harness": "claude" }));
+    world.cli(&["sources", "poll"]);
+    let candidate = world.wait("the source item as a candidate", || {
+        let list = world.cli(&["candidates"]);
+        list.as_array()?.iter().find(|c| c["request"]["id"] == "issues:12").cloned()
+    });
+    assert_eq!(candidate["strength"], "inferred");
+    assert_eq!(candidate["request"]["actor"], "ana");
+    // Polling again brings nothing new.
+    world.cli(&["sources", "poll", "issues"]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(world.cli(&["candidates"]).as_array().unwrap().len(), 1);
+    // Outside text is not accepted on its own word.
+    let (ok, _, stderr) = world.try_cli(&["route", "issues:12", "accept", "--title", "Crash on login"]);
+    assert!(!ok, "accepted without a rule: {stderr}");
+    let decision = world.cli(&[
+        "route",
+        "issues:12",
+        "accept",
+        "--title",
+        "Crash on login",
+        "--rule",
+        "source:issues",
+        "--workflow",
+        "bugfix",
+    ]);
+    assert!(decision["ticket_id"].is_string());
+    // A source without a program asks the session to look.
+    world.wait("the session being asked to look at Jira", || {
+        world
+            .prompts(&session_pane)
+            .iter()
+            .any(|t| t.contains("Source `jira` is due") && t.contains("--source jira --id jira:<key>"))
+            .then_some(())
+    });
+    let sources = world.cli(&["sources"]);
+    assert!(sources[0]["status"].as_str().unwrap().starts_with("ok "), "{sources}");
+}
+
+#[test]
+fn an_autonomous_worker_is_held_at_a_risky_command_until_a_person_approves_it() {
+    let world = world("id = \"e2e\"\ncalibrated = true\n");
+    let repo = repo(&world);
+    let submitted = world.cli(&[
+        "submit",
+        "Tidy the README",
+        "--workflow",
+        "general",
+        "--mode",
+        "autonomous",
+        "--project",
+        repo.to_str().unwrap(),
+    ]);
+    let ticket_id = submitted["ticket_id"].as_str().unwrap().to_string();
+    let ticket = world.wait("the worker", || {
+        let ticket = world.cli(&["ticket", &ticket_id]);
+        ticket["assignments"][0]["pane_id"].is_string().then_some(ticket)
+    });
+    assert_eq!(ticket["mode"], "autonomous");
+    let worktree = ticket["execution"]["directory"].as_str().unwrap().to_string();
+    let shims = world.dir.path().join("state/profiles/e2e/shims");
+    // The worker's shell has the shims first on PATH, as the daemon exported them.
+    let exported = world
+        .calls("pane.send_input")
+        .iter()
+        .any(|p| p["text"].as_str().unwrap_or("").contains(&format!("PATH={}", shims.display())));
+    assert!(exported, "the shims lead the worker's PATH");
+    let run = |args: &[&str]| {
+        let path = format!("{}:{}", shims.display(), std::env::var("PATH").unwrap());
+        let mut command = world.command();
+        // `world.command()` is the plugin binary; the shim is what a worker's shell would find as `git`.
+        let _ = &mut command;
+        Command::new(shims.join("git"))
+            .args(args)
+            .current_dir(&worktree)
+            .env("PATH", path)
+            .env("SUPERAGENT_TICKET", &ticket_id)
+            .env("SUPERAGENT_WORKTREE", &worktree)
+            .env("SUPERAGENT_PROFILE", "e2e")
+            .env("HERDR_SUPERAGENT_STATE_DIR", world.dir.path().join("state"))
+            .env("HERDR_SUPERAGENT_CONFIG_DIR", world.dir.path().join("config"))
+            .env("HERDR_SOCKET_PATH", &world.herdr_socket)
+            .output()
+            .unwrap()
+    };
+    // Harmless commands pass straight through to the real git.
+    let status = run(&["status", "-sb"]);
+    assert!(
+        status.status.success() && String::from_utf8_lossy(&status.stdout).contains("sa/"),
+        "{status:?}"
+    );
+    // A push to the default branch becomes a checkpoint instead of running.
+    let held = run(&["push", "origin", "main"]);
+    assert_eq!(held.status.code(), Some(75), "{}", String::from_utf8_lossy(&held.stderr));
+    let waiting = world.cli(&["ticket", &ticket_id]);
+    assert_eq!(waiting["checkpoint"]["name"], "guard-git");
+    assert_eq!(waiting["stage"], "person/review");
+    // Approved, exactly that command runs once (and fails only because the test repo has no remote).
+    world.cli(&["approve", &ticket_id]);
+    let allowed = run(&["push", "origin", "main"]);
+    assert_ne!(allowed.status.code(), Some(75), "an approved command is not held again");
+    assert!(String::from_utf8_lossy(&allowed.stderr).contains("was approved"));
+    let again = run(&["push", "origin", "main"]);
+    assert_eq!(again.status.code(), Some(75), "the approval was for one run");
+}

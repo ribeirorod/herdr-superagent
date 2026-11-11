@@ -126,6 +126,16 @@ pub fn real_tool(tool: &str, shims: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// PATH without the shims directory.
+pub fn path_without(shims: &Path) -> std::ffi::OsString {
+    let canonical = std::fs::canonicalize(shims).unwrap_or_else(|_| shims.to_path_buf());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| dir != shims && std::fs::canonicalize(dir).map(|d| d != canonical).unwrap_or(true))
+        .collect();
+    std::env::join_paths(kept).unwrap_or(path)
+}
+
 /// Writes the shim scripts into `dir`; returns the directory to prepend to PATH.
 pub fn write_shims(dir: &Path, binary: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
