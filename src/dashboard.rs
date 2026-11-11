@@ -1,5 +1,6 @@
-//! The read-only task list for the cockpit's right pane (PLAN §8b, v1).
-//! Phase 6 replaces it with the interactive ratatui dashboard.
+//! The cockpit's task pane (PLAN §8b). On a terminal it is the interactive
+//! cockpit (`cockpit.rs`); this file keeps the plain text list for `--once`,
+//! `--plain` and pipes, and the restart into a new build.
 
 use std::io::Write;
 use std::time::Duration;
@@ -59,8 +60,49 @@ pub fn cut(line: &str, width: usize) -> String {
     out
 }
 
-pub fn run(profile: &str, once: bool) -> Result<(), String> {
+/// Restarts into the binary on PATH: a rebuilt daemon means a rebuilt dashboard.
+#[cfg(unix)]
+fn restart(profile: &str) -> String {
+    use std::os::unix::process::CommandExt;
+    let program = if crate::daemon::on_path("herdr-superagent") {
+        std::path::PathBuf::from("herdr-superagent")
+    } else {
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("herdr-superagent"))
+    };
+    let error = std::process::Command::new(program).args(["dashboard", "--profile", profile]).exec();
+    format!("dashboard restart failed: {error}")
+}
+
+fn is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: isatty only inspects the descriptor.
+        unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 && libc::isatty(libc::STDIN_FILENO) == 1 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// The cockpit's task pane. On a terminal it is interactive; `--plain`, `--once`
+/// and a pipe get the text list.
+pub fn run(profile: &str, once: bool, plain: bool) -> Result<(), String> {
     let paths = Paths::for_profile(profile);
+    if !once && !plain && is_tty() {
+        if let (Ok(herdr), Ok(pane)) = (crate::herdr::Herdr::from_env(), std::env::var("HERDR_PANE_ID")) {
+            let _ = herdr.report_pane_metadata(
+                &pane,
+                Some(&format!("tasks · {profile}")),
+                &[("sa_role", "dashboard"), ("sa_profile", profile)],
+            );
+        }
+        return match crate::cockpit::run(profile)? {
+            #[cfg(unix)]
+            true => Err(restart(profile)),
+            _ => Ok(()),
+        };
+    }
     #[cfg(unix)]
     if !once {
         // Ctrl-C would close the pane (no shell underneath); the pane's close action quits the dashboard.
@@ -82,16 +124,7 @@ pub fn run(profile: &str, once: bool) -> Result<(), String> {
                 let build = ping["build"].as_str().unwrap_or("");
                 if !build.is_empty() && build != crate::daemon::BUILD {
                     #[cfg(unix)]
-                    {
-                        use std::os::unix::process::CommandExt;
-                        let program = if crate::daemon::on_path("herdr-superagent") {
-                            std::path::PathBuf::from("herdr-superagent")
-                        } else {
-                            std::env::current_exe().map_err(|e| e.to_string())?
-                        };
-                        let error = std::process::Command::new(program).args(["dashboard", "--profile", profile]).exec();
-                        return Err(format!("dashboard restart failed: {error}"));
-                    }
+                    return Err(restart(profile));
                 }
             }
         }

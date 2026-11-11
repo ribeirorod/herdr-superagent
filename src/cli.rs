@@ -51,8 +51,12 @@ pub enum Command {
     },
     /// The read-only task list (the cockpit's right pane). `--once` prints one frame.
     Dashboard {
+        /// Print the task list once and exit.
         #[arg(long)]
         once: bool,
+        /// The read-only text list instead of the interactive cockpit.
+        #[arg(long)]
+        plain: bool,
     },
     /// Show the log files: `logs`, `logs --process daemon --lines 200`, `logs --follow`.
     Logs {
@@ -428,8 +432,8 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             let value = daemon("reindex", json!({}))?;
             out(value.clone(), format!("reindexed {} tickets", value["tickets"]))
         }
-        Command::Dashboard { once } => {
-            crate::dashboard::run(&profile, once)?;
+        Command::Dashboard { once, plain } => {
+            crate::dashboard::run(&profile, once, plain)?;
             Ok(0)
         }
         Command::Memory {

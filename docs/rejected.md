@@ -24,3 +24,16 @@ restart with a recovery note, resume under the same mandate, the question
 semantics of a report, decision idempotence, deadline and requeue, pause, the
 durable effect queue, and the store design (JSON aggregates in SQLite with a
 few indexed columns).
+
+## Decided later
+
+| Question | Decision | Why |
+|---|---|---|
+| **sqlite-vec** for semantic memory | not used; vectors are blobs compared in process | The extension would have to be compiled and shipped per platform next to a bundled SQLite. A project holds hundreds to a few thousand entries, where a linear cosine scan takes well under a millisecond. Revisit above about 50,000 entries per project. |
+| **A hosted embedding API** | refused by validation | Embedding sends the text. `memory.endpoint` must be local. |
+| **An LLM to summarise imported sessions** | extractive only | It would cost tokens per session and could invent. The first request, the follow-ups, the last answer and the changed files are what a later ticket searches for. |
+| **The harness's own subagents** (Claude's Task/Agent tool) | off for the session and for workers | They are invisible to herdr, the dashboard and the person; in the session they turn routing into doing the work. `harness_flags.session` and `.worker` can re-enable them. |
+| **Auto-accepting source items** | never | An issue or a mail is outside text. It becomes work only when routing names the source as its rule; the scorer fallback applies to the person's own requests only. |
+| **Workflow steps driven by the engine** (one assignment per step) | steps are the root worker's plan | The worker keeps its context across steps and spawns only the steps of another role. The engine enforces what must not be skipped: the required checkpoints. |
+| **Removing dirty worktrees on tidy** | kept | `git worktree remove` without force; unpushed or uncommitted work is never deleted for tidiness. |
+| **Rewriting `~/.claude/settings.json`** to keep global styles and hooks out | not done | `--setting-sources project,local` per launch does it without touching the person's files. |

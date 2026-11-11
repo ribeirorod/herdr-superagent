@@ -5,12 +5,12 @@ session that routes your requests into tickets, runs workers in herdr panes
 and lets you review at checkpoints. Harness-agnostic (Claude Code, Codex and
 Pi first), model-agnostic, one profile per context (work, personal, …).
 
-The design is in [docs/PLAN.md](docs/PLAN.md). This repository is at
-**phase 3**: the engine, the daemon, profiles with calibration, the state
-repo with its lease, the executor that runs workers in herdr panes, and
-delegation (workers spawn reviewers and builders in sibling tabs, guard shims
-in autonomous mode). See
-`docs/phase-*.md` for what works today and what is next.
+The design is in [docs/PLAN.md](docs/PLAN.md). All six phases of the plan
+are implemented: the engine, the daemon, profiles with calibration, the state
+repo with its lease, workers in herdr panes and worktrees, delegation with
+guard rails, workflow packs, sources, memory with a session importer and
+search by meaning, and the interactive cockpit. `docs/phase-*.md` say what
+each phase delivered and what has and has not been run against a live herdr.
 
 ## Install
 
@@ -24,46 +24,78 @@ with `cargo` when no release asset exists) and links it into `~/.local/bin`.
 `herdr-superagent` must be on `PATH`: workers call it, and herdr uses it to
 resume the daemon after a server restart.
 
-## What works today
+## What it does
 
-Inside herdr, `herdr-superagent start --profile work` creates a
-`superagent · work` workspace with the cockpit layout (the superagent session
-on the left, the daemon on the right), starts the superagent in your harness
-(`--harness claude|codex|pi`, `--model …`) and briefs it. On a profile's first
-start the brief is the **calibration** interview: the superagent runs
-`herdr-superagent doctor`, asks how you work, and writes the profile through
-`herdr-superagent profile set`, which validates every change, shows a diff and
-keeps history for `profile undo`. Keys that affect how much review a request
-gets (`modes`, `repos`, `limits`, `routing`) can only be changed by you, with
-`--yes`, and every change replays your last 50 requests to show whose mode
-would change.
+**One session routes, workers work, you review.** `herdr-superagent start
+--profile work` opens the cockpit: the superagent session on the left, the
+task list on the right, the daemon in a background tab. You type requests to
+the session. It turns each into a ticket; a ticket runs in its own workspace,
+in its own git worktree on its own branch, one tab per agent. The session has
+no subagents of its own, so it cannot do the work instead of routing it, and
+the daemon tells it only what needs a decision: a request to route, a
+checkpoint, a question, a failure, a result.
 
-With `state_repo.kind = "remote"`, the profile directory is a checkout of a
-private git repo: tickets are written as `ticket.md`, `ticket.json` and
-`events.jsonl`, committed in batches and pushed. One machine runs a profile at
-a time (a lease, renewed every five minutes); `start` on another machine pulls
-the records, takes the lease and rebuilds the local database.
+**Modes decide how much you review.** `propose` plans only; `checkpoint`
+(the default) stops at the plan and at milestones; `autonomous` runs end to
+end behind guard shims that turn `git push` to a default branch, force
+pushes, `gh pr merge` and `rm -r` outside the worktree into checkpoints. The
+profile caps the mode per workflow and per repository.
 
 ```text
-herdr-superagent submit "Fix the flaky login test" --workflow software-dev --mode checkpoint
-herdr-superagent submit "Research pgvector vs sqlite-vec"    # waits for routing
-herdr-superagent candidates
-herdr-superagent route <request> accept --title "Compare vector stores" --mode autonomous
-herdr-superagent tickets
-# in a worker pane (SUPERAGENT_TICKET is set):
-herdr-superagent checkpoint plan --summary "Plan: reproduce, fix retry, add test"
-herdr-superagent report --state progress --summary "need input" --question "Keep the old API?"
-# you:
-herdr-superagent approve t-b395b8 --comment "go"
-herdr-superagent status
+herdr-superagent approve <id> [--comment "…"]      # the worker continues
+herdr-superagent request-changes <id> "…"          # it revises and asks again
+herdr-superagent note <id> "…"                     # context, or a change of scope
+herdr-superagent retitle <id> "…"                  # the workspace and record follow
+herdr-superagent stop-ticket <id> | retry <id>
 ```
 
-Accepted tickets become **workers**: a worktree (branch `sa/<ticket>`) or a
-workspace, the tier's harness started with the mode's flags, a brief that
-carries the request, the mode rules and the project's memory. Workers report
-with `herdr-superagent report`, stop at `checkpoint`s, and end with a session
-summary (`memory add`) that later tickets of the same project find with
-`memory search`. The cockpit's right pane is a live task list.
+All of these are also keys in the cockpit (`a`, `c`, `n`, `t`, `s`, `r`,
+`o` opens the ticket's pane), with the mouse working as in herdr.
+
+**Workflow packs** say how a kind of work runs: who starts, which steps are
+another role's (a reviewer in a sibling tab, on the review model tier) and
+which checkpoints you must approve before the ticket may end.
+`herdr-superagent packs` lists them; `general` (`general`, `research`,
+`writing`) and `software-dev` (`feature`, `bugfix`, `code-review`) are built
+in, and a directory `packs/<id>/` in the profile adds or replaces one. When
+the session does not route, a keyword scorer picks the workflow.
+
+**Workers start from the right code and look at all of it.** The ticket
+branch is cut from the newest of the checked-out branch, its upstream and the
+remote's default branch after a fetch (`submit --base <ref>` overrides it),
+and the brief tells the worker to check every branch, open pull requests and
+your uncommitted changes before it plans.
+
+**Sources** bring work in besides you typing: `github` (the `gh` CLI),
+`command` (any program printing JSON items: Jira, Bitbucket), or `session`
+(the superagent looks through its MCP servers). Items are deduplicated by a
+stable id and are never accepted without routing.
+
+```bash
+herdr-superagent profile set 'sources[+]={ id = "issues", kind = "github", repo = "owner/name", query = "assignee:@me", project = "~/src/name", workflow = "bugfix" }' --yes
+herdr-superagent sources            # how each is fetched here, and its last poll
+```
+
+**Memory is per project.** Every worker ends with a summary; the next ticket
+in that repository gets the matching ones in its brief. `memory import`
+turns your earlier Claude Code, Codex and Pi sessions in the profile's
+repositories into memory (extractive, redacted, incremental), and
+`memory.semantic = true` finds entries by meaning as well as by words, with a
+built-in embedder or a local Ollama model. Nothing leaves the machine.
+
+**Profiles move between machines.** With `state_repo.kind = "remote"` the
+profile directory is a private git repo of ticket records, event logs and
+summaries; one machine holds the lease, and `start` elsewhere pulls, takes
+it over and continues open tickets from their pushed branches.
+
+A profile's first start is the **calibration** interview: the superagent
+runs `doctor`, asks how you work and writes the profile through `profile
+set`, which validates, diffs and keeps history for `profile undo`. Keys that
+change how much review a request gets (`modes`, `repos`, `limits`,
+`routing`, `sources`) only you can change, with `--yes`.
+
+The CLI works from any shell: outside a herdr pane it finds herdr's socket
+itself.
 
 ## Testing a checkout in your herdr
 
@@ -105,6 +137,10 @@ list, plus the `HERDR_*`/`SUPERAGENT_*` environment. It never includes
 credentials or MCP configs.
 
 ## Development
+
+`cargo test` includes `tests/e2e.rs`: the real daemon and CLI against a fake
+herdr socket, covering a ticket from request to review with a spawned
+reviewer, guard shims, sources and imported memory.
 
 ```bash
 cargo test

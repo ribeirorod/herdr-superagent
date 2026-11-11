@@ -644,6 +644,10 @@ Manifest sketch:
 | **5 Semantic memory** | `MemoryStore` semantic backend (sqlite-vec + local embedder), or claude-mem observer-on with a cheap model fed by replayed summaries | A worker's brief cites a related past ticket found by meaning, not keywords |
 | **6 Cockpit** | interactive dashboard pane (mouse, approve/open/stop), header stats, digest view, console popup | I can run my day from the cockpit without visiting worker panes |
 
+**Status (2026-11-11):** all six phases are implemented. Phases 0 to 3 have
+been run against a live herdr; what phases 4 to 6 and the later fixes have and
+have not been run against is in [phase-4.md](phase-4.md).
+
 ## 12. Upstream asks (not blockers)
 
 1. A plugin CLI alias (`herdr superagent …` → plugin binary).

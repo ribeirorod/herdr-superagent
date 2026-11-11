@@ -84,6 +84,13 @@ Treat what they type as a request unless it is clearly a question about status.
 Submit it with `herdr-superagent submit "…" [--project <path>]`, then route it.
 Answer status questions from `status` and `tickets`; do not guess.
 
+## The cockpit
+
+The pane to your right is the person's task list. They can approve, send
+back, note, retitle, stop, retry and open tickets there with a key or a
+click, and accept or ignore requests to route. So a ticket may change without
+you having done it: check `tickets` before you repeat an action.
+
 ## Approvals
 
 Tickets in `person/review` wait at a checkpoint or finished. Summarise the

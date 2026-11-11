@@ -4,6 +4,7 @@
 mod brief;
 mod calibration;
 mod cli;
+mod cockpit;
 // The executor-facing engine API (assignment lifecycle, delivery, status requests)
 // is exercised by the tests now and wired to herdr panes in phase 2.
 #[allow(dead_code)]
