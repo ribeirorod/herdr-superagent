@@ -477,7 +477,10 @@ impl Daemon {
             .store
             .memory_search_hybrid(&project_key, &question, 5, self.embedder().as_ref())
             .unwrap_or_default();
+        let external = profile.memory.backend != "builtin";
+        let hits = if external { Vec::new() } else { hits };
         let extra = brief::Extra {
+            external_memory: external.then(|| (profile.memory.backend.clone(), project_key.clone())),
             workflow_steps: chosen_pack.as_ref().map(|c| c.brief_section(&role)).unwrap_or_default(),
             role_prompt: chosen_pack
                 .as_ref()
@@ -529,6 +532,7 @@ impl Daemon {
                 }
             }
         }
+        exports.extend(profile.harness_flags.exports(&profile.memory));
         let line = format!("export {}; clear", shell_words(&exports));
         if let Err(e) = herdr.pane_run(&pane_id, &line) {
             return Outcome::Fail(format!("export env: {e}"));

@@ -28,6 +28,8 @@ pub struct Session {
     /// What the person typed, in order, without tool results and injected context.
     pub asked: Vec<String>,
     pub last_answer: String,
+    /// The answer that closed each earlier turn: where decisions along the way were stated.
+    pub answers: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -45,7 +47,15 @@ pub enum Skip {
     Unchanged,
     Unreadable,
     TooOld,
+    /// A subagent's prompt, a persona prompt or a one-word probe ("hi", "reply with ack"): not the person's work.
+    Probe,
+    /// The project has curated notes (`memory.notes`): its sessions are not imported beside them.
+    Covered,
 }
+
+/// Bumped when what an entry holds changes: marks from an older version do not count,
+/// and the entries they made are replaced.
+pub const VERSION: &str = "v2";
 
 fn text_of(value: &Value, key: &str) -> Option<String> {
     [
@@ -150,6 +160,39 @@ fn injected(text: &str) -> bool {
         || t.starts_with("[superagent daemon]")
 }
 
+/// Removes text a hook put in front of what the person typed. A hook's text is a block of its
+/// own: every leading paragraph that starts with one of `prefixes` goes, as does a whole
+/// message that is nothing else.
+pub fn strip_hooks(text: &str, prefixes: &[String]) -> String {
+    let mut rest = text.trim_start();
+    loop {
+        let hit = prefixes
+            .iter()
+            .filter(|p| !p.trim().is_empty())
+            .any(|p| rest.len() >= p.len() && rest[..p.len().min(rest.len())].eq_ignore_ascii_case(p));
+        if !hit {
+            return rest.to_string();
+        }
+        rest = match rest.find("\n\n") {
+            Some(end) => rest[end..].trim_start(),
+            None => "",
+        };
+    }
+}
+
+/// A session that is not the person's work: a prompt written for an agent, or a probe.
+fn probe(asked: &[String], last_answer: &str, changed_files: bool) -> bool {
+    let first = asked.first().map(|a| a.trim()).unwrap_or("");
+    let lower = first.to_lowercase();
+    if lower.starts_with("you are ") || lower.starts_with("your task is ") || lower.starts_with("you're a ") {
+        return true;
+    }
+    let words: usize = asked.iter().map(|a| a.split_whitespace().count()).sum();
+    // "hi", "say only: one", "Reply with exactly one word: ack": a few words in, a few words out.
+    // A short exchange that changed a file was work, however few words it took.
+    !changed_files && words <= 6 && last_answer.split_whitespace().count() <= 8
+}
+
 fn own_session(first: &str) -> bool {
     let t = first.trim_start();
     t.starts_with("You are the superagent for herdr profile")
@@ -158,6 +201,11 @@ fn own_session(first: &str) -> bool {
 
 /// Reads one transcript (JSON lines) of any of the three harnesses.
 pub fn parse(harness: &str, path: &Path, text: &str) -> Result<Session, Skip> {
+    parse_with(harness, path, text, &[])
+}
+
+/// `parse`, dropping hook text that starts with one of `strip` from the person's messages.
+pub fn parse_with(harness: &str, path: &Path, text: &str, strip: &[String]) -> Result<Session, Skip> {
     let mut session = Session {
         harness: harness.to_string(),
         id: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(),
@@ -213,10 +261,15 @@ pub fn parse(harness: &str, path: &Path, text: &str) -> Result<Session, Skip> {
         let Some(holder) = holder else { continue };
         let role = holder.get("role").and_then(Value::as_str).unwrap_or("");
         let body = content_text(&holder["content"], &mut session.files);
+        let body = if role == "user" { strip_hooks(&body, strip) } else { body };
         let body = body.trim();
         match role {
             "user" if !injected(body) => {
                 if session.asked.last().map(String::as_str) != Some(body) {
+                    // The answer standing when the person spoke again closed the turn before.
+                    if !session.last_answer.is_empty() && session.answers.last() != Some(&session.last_answer) {
+                        session.answers.push(session.last_answer.clone());
+                    }
                     session.asked.push(body.to_string());
                 }
             }
@@ -231,6 +284,7 @@ pub fn parse(harness: &str, path: &Path, text: &str) -> Result<Session, Skip> {
         None => Err(Skip::Empty),
         Some(first) if own_session(first) => Err(Skip::Own),
         Some(_) if session.last_answer.is_empty() => Err(Skip::Empty),
+        Some(_) if probe(&session.asked, &session.last_answer, !session.files.is_empty()) => Err(Skip::Probe),
         Some(_) => Ok(session),
     }
 }
@@ -262,12 +316,30 @@ pub fn entry(session: &Session, project: &str) -> MemoryEntry {
             body.push_str(&format!("- … and {} more\n", session.asked.len() - 9));
         }
     }
+    // Decisions are usually stated when a turn closes, long before the last answer.
+    let along: Vec<&String> = session.answers.iter().filter(|a| **a != session.last_answer).collect();
+    if !along.is_empty() {
+        body.push_str("\n## What was concluded along the way\n\n");
+        let skip = along.len().saturating_sub(8);
+        if skip > 0 {
+            body.push_str(&format!("- … {skip} earlier turns left out\n"));
+        }
+        for answer in along.iter().skip(skip) {
+            body.push_str(&format!(
+                "- {}\n",
+                clip(&answer.split_whitespace().collect::<Vec<_>>().join(" "), 320)
+            ));
+        }
+    }
     body.push_str(&format!(
         "\n## Outcome (the session's last answer)\n\n{}\n",
-        clip(&session.last_answer, 1500)
+        clip(&session.last_answer, 2500)
     ));
     body.push_str("\n## Files and links\n\n");
     let cwd = session.cwd.trim_end_matches('/');
+    if let Some(folder) = Path::new(cwd).file_name().and_then(|n| n.to_str()) {
+        body.push_str(&format!("- folder: {folder} ({cwd})\n"));
+    }
     for file in session.files.iter().take(20) {
         let shown = file.strip_prefix(cwd).map(|f| f.trim_start_matches('/')).unwrap_or(file);
         body.push_str(&format!("- {shown}\n"));
@@ -285,7 +357,21 @@ pub fn entry(session: &Session, project: &str) -> MemoryEntry {
         session.asked.len()
     ));
     MemoryEntry {
-        id: crate::core::ids::key(&["session", &session.harness, &session.id]),
+        // One conversation recorded by two harnesses (one driving the other) is one entry:
+        // the id is the project, the day and what was asked, not the transcript it came from.
+        id: crate::core::ids::key(&[
+            "session",
+            project,
+            &date,
+            &goal
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+                .chars()
+                .take(200)
+                .collect::<String>(),
+        ]),
         project: project.to_string(),
         ticket_id: None,
         assignment_id: None,
@@ -359,7 +445,28 @@ pub fn discover(home: &Path, harness: Option<&str>) -> Vec<(String, PathBuf)> {
 pub fn mark(path: &Path) -> Option<(String, u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    Some((format!("{modified}:{}", meta.len()), modified, meta.len()))
+    Some((format!("{VERSION}:{modified}:{}", meta.len()), modified, meta.len()))
+}
+
+/// How a session opens: the start of the first thing typed, for spotting a hook preamble
+/// that many sessions share.
+pub fn opening(harness: &str, path: &Path) -> Option<String> {
+    if std::fs::metadata(path).ok()?.len() > MAX_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let session = match parse(harness, path, &text) {
+        Ok(session) => session,
+        Err(_) => return None,
+    };
+    let first = session.asked.first()?;
+    // Only a block of its own can be a preamble: something follows it after a blank line.
+    let (head, rest) = first.split_once("\n\n")?;
+    if rest.trim().is_empty() {
+        return None;
+    }
+    let head: String = head.lines().next().unwrap_or("").chars().take(40).collect();
+    (head.trim().chars().count() >= 12).then(|| head.trim().to_string())
 }
 
 /// What a run decided about one file.
@@ -375,6 +482,10 @@ pub struct Options<'a> {
     /// Only this project key.
     pub project: Option<&'a str>,
     pub since_days: Option<u64>,
+    /// Leading hook text to drop from the person's messages (`memory.import_strip`).
+    pub strip: &'a [String],
+    /// Project keys that have curated notes: their sessions are left alone.
+    pub covered: &'a [String],
 }
 
 /// Decides one file: unchanged, skipped, or the entry to store with the file's new mark.
@@ -400,7 +511,7 @@ pub fn consider(harness: &str, path: &Path, known_mark: Option<&str>, options: &
     let Ok(text) = std::fs::read_to_string(path) else {
         return Outcome::Skip(Skip::Unreadable);
     };
-    let session = match parse(harness, path, &text) {
+    let session = match parse_with(harness, path, &text, options.strip) {
         Ok(session) => session,
         Err(skip) => return Outcome::Skip(skip),
     };
@@ -423,6 +534,9 @@ pub fn consider(harness: &str, path: &Path, known_mark: Option<&str>, options: &
         .unwrap_or_else(|| crate::memory::NOTES_PROJECT.to_string());
     if options.project.map(|p| p != project).unwrap_or(false) {
         return Outcome::Skip(Skip::Outside);
+    }
+    if options.covered.contains(&project) {
+        return Outcome::Skip(Skip::Covered);
     }
     Outcome::Import(Box::new(entry(&session, &project)), stamp)
 }
@@ -493,6 +607,13 @@ mod tests {
         let first = entry(&session, "acme/api");
         assert_eq!(first.id, entry(&session, "acme/api").id, "the same session is the same entry");
         assert_eq!(first.title, "claude session 2026-10-02: Fix the flaky login test");
+        assert!(first.body.contains("## What was concluded along the way") && first.body.contains("- Looking."));
+        assert!(first.body.contains("- folder: api (/src/api)"));
+        // The same conversation seen through another harness is the same entry.
+        let mut through_pi = session.clone();
+        through_pi.harness = "pi".into();
+        through_pi.id = "other-id".into();
+        assert_eq!(entry(&through_pi, "acme/api").id, first.id);
         assert!(first.body.contains("## Goal") && first.body.contains("It fails one run in five."));
         assert!(first.body.contains("- Also add a regression test"));
         assert!(
@@ -514,6 +635,47 @@ mod tests {
             Skip::Empty
         );
         assert_eq!(parse("claude", Path::new("/x/e.jsonl"), "not json").unwrap_err(), Skip::Unreadable);
+        let exchange = |ask: &str, answer: &str| {
+            format!(
+                "{}\n{}",
+                serde_json::json!({ "type": "user", "cwd": "/w", "message": { "role": "user", "content": ask } }),
+                serde_json::json!({ "type": "assistant", "message": { "role": "assistant", "content": answer } })
+            )
+        };
+        // Prompts written for an agent, and probes, are not the person's work.
+        for (ask, answer) in [
+            (
+                "You are a graphify extraction subagent. Extract the nodes from the files below and return JSON.",
+                "{\"nodes\": []} and a long explanation of what was extracted from each file",
+            ),
+            ("hi", "Hello! How can I help?"),
+            ("Reply with exactly one word: ack", "ack"),
+        ] {
+            assert_eq!(
+                parse("claude", Path::new("/x/p.jsonl"), &exchange(ask, answer)).unwrap_err(),
+                Skip::Probe,
+                "{ask}"
+            );
+        }
+        // A hook's preamble is not what the person asked, whether it leads the message or is all of it.
+        let strip = vec!["CAVEMAN MODE ACTIVE".to_string()];
+        let hooked = exchange(
+            "CAVEMAN MODE ACTIVE. Respond terse. Drop articles.\nNo filler.\n\nWhy does the nightly dbt run time out on the orders model?",
+            "The orders model scans the full table each night; make it incremental on updated_at.",
+        );
+        let session = parse_with("claude", Path::new("/x/h.jsonl"), &hooked, &strip).unwrap();
+        assert_eq!(session.asked, vec!["Why does the nightly dbt run time out on the orders model?"]);
+        assert!(entry(&session, "acme/dbt")
+            .title
+            .ends_with("Why does the nightly dbt run time out on the orders model?"));
+        let only_hook = exchange(
+            "caveman mode active. Respond terse.",
+            "ok, terse mode on for this whole session now and later",
+        );
+        assert_eq!(
+            parse_with("claude", Path::new("/x/h.jsonl"), &only_hook, &strip).unwrap_err(),
+            Skip::Empty
+        );
     }
 
     #[test]
@@ -534,6 +696,8 @@ mod tests {
             all: false,
             project: None,
             since_days: None,
+            strip: &[],
+            covered: &[],
         };
         let stamp = match consider("claude", &file, None, &options) {
             Outcome::Import(entry, stamp) => {
@@ -563,6 +727,8 @@ mod tests {
             all: false,
             project: None,
             since_days: None,
+            strip: &[],
+            covered: &[],
         };
         match consider("claude", &gone, None, &within) {
             Outcome::Import(entry, _) => assert_eq!(entry.project, "repo", "keyed by the repository that held it"),

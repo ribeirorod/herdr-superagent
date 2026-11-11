@@ -239,6 +239,31 @@ impl SqliteStore {
         .flatten()
     }
 
+    pub fn memory_delete(&self, id: &str) -> Result<(), UserError> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM memory_vec WHERE id = ?1", params![id])?;
+            conn.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Removes imported session entries, of the given projects or of all; returns their ids.
+    pub fn memory_forget_sessions(&self, projects: Option<&[String]>) -> Result<Vec<String>, UserError> {
+        let ids: Vec<(String, String)> = self.with_conn(|conn| {
+            let mut statement = conn.prepare("SELECT id, project FROM memory WHERE role LIKE 'session-%'")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.filter_map(Result::ok).collect())
+        })?;
+        let mut gone = Vec::new();
+        for (id, project) in ids {
+            if projects.map(|p| p.contains(&project)).unwrap_or(true) {
+                self.memory_delete(&id)?;
+                gone.push(id);
+            }
+        }
+        Ok(gone)
+    }
+
     pub fn memory_count(&self) -> i64 {
         self.with_conn(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM memory", [], |row| row.get(0))?))
             .unwrap_or(0)

@@ -110,6 +110,8 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
         // A greyed-out suggested reply reads like a typed approval; approvals only count through `approve`.
         "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false".to_string(),
     ];
+    let mut exports = exports.to_vec();
+    exports.extend(profile.harness_flags.exports(&profile.memory));
     let _ = herdr.pane_run(&pane.pane_id, &format!("export {}; clear", crate::ensure::shell_words(&exports)));
     std::thread::sleep(Duration::from_millis(800));
     let start = || {

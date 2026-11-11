@@ -24,6 +24,7 @@ mod importer;
 mod ipc;
 mod logging;
 mod memory;
+mod notes;
 mod notify;
 mod packs;
 mod paths;

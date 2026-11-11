@@ -383,6 +383,24 @@ impl StateRepo {
         self.write_memory_file(entry, "sessions")
     }
 
+    /// Removes the files of memory entries that were deleted (imported sessions, vanished notes).
+    pub fn remove_memory_files(&self, ids: &[String]) {
+        let mut files = Vec::new();
+        collect_md(&self.dir.join("memory"), &mut files);
+        for file in files {
+            let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let kind = file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(kind, "sessions" | "curated") && ids.iter().any(|id| id == stem) {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
+    }
+
+    /// A curated note read from a notes folder.
+    pub fn write_curated(&self, entry: &crate::memory::MemoryEntry) -> Result<PathBuf, String> {
+        self.write_memory_file(entry, "curated")
+    }
+
     fn write_memory_file(&self, entry: &crate::memory::MemoryEntry, kind: &str) -> Result<PathBuf, String> {
         let project: String = entry.project.chars().map(|c| if c == '/' { '_' } else { c }).collect();
         let dir = self.dir.join("memory").join(project).join(kind);

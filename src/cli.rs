@@ -247,6 +247,8 @@ pub enum MemoryAction {
     },
     /// Print one memory entry in full.
     Show { id: String },
+    /// Read the profile's curated notes folders (`memory.notes`) now; they are also re-read every five minutes.
+    Notes,
     /// Turn your earlier Claude Code, Codex and Pi sessions into project memory (extractive, redacted, incremental).
     Import {
         /// claude, codex, pi or all.
@@ -509,6 +511,28 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             )
         }
         Command::Memory {
+            action: MemoryAction::Notes,
+        } => {
+            let value = daemon("notes_sync", json!({}))?;
+            let mut lines = vec![format!(
+                "notes: {} read, {} unchanged, {} forgotten (file gone){}",
+                value["added"],
+                value["unchanged"],
+                value["removed"],
+                match value["sessions_removed"].as_u64() {
+                    Some(n) if n > 0 => format!("; {n} imported sessions of these projects removed"),
+                    _ => String::new(),
+                }
+            )];
+            if value["projects"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                lines.push("no notes folders in the profile; add one with `profile set 'memory.notes[+]={ path = \"~/notes/out/myrepo\", project = \"~/src/myrepo\" }'`".to_string());
+            }
+            for problem in value["problems"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                lines.push(format!("  problem: {problem}"));
+            }
+            out(value.clone(), lines.join("\n"))
+        }
+        Command::Memory {
             action:
                 MemoryAction::Import {
                     harness,
@@ -529,16 +553,61 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let marks = daemon("import_marks", json!({}))?;
+            let mut marks = daemon("import_marks", json!({}))?;
+            // Entries an older importer made are replaced, not kept beside the new ones.
+            let version = format!("{}:", crate::importer::VERSION);
+            let stale = marks
+                .as_object()
+                .map(|m| {
+                    m.values()
+                        .filter_map(Value::as_str)
+                        .any(|v| !v.is_empty() && !v.starts_with(&version))
+                })
+                .unwrap_or(false);
+            let mut replaced = 0;
+            if stale && !dry_run {
+                replaced = daemon("memory_forget_sessions", json!({}))?["removed"].as_u64().unwrap_or(0);
+                marks = json!({});
+            }
             let project_key = project.map(|p| crate::memory::project_key(&p).unwrap_or(p));
+            // Projects with curated notes keep to their notes.
+            let covered: Vec<String> = settings["memory"]["notes"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n["project"].as_str())
+                        .map(|p| crate::memory::project_key(p).unwrap_or_else(|| p.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+            let files = discover(&home, Some(&harness));
+            // A paragraph that opens several sessions is a hook's preamble, not what you asked.
+            let mut strip: Vec<String> = settings["memory"]["import_strip"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            let mut heads: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (name, file) in &files {
+                let known = marks.get(file.display().to_string()).and_then(Value::as_str);
+                if known.is_some_and(|k| crate::importer::mark(file).is_some_and(|(m, _, _)| m == k)) {
+                    continue;
+                }
+                if let Some(head) = crate::importer::opening(name, file) {
+                    *heads.entry(head).or_default() += 1;
+                }
+            }
+            let mut detected: Vec<String> = heads.into_iter().filter(|(_, n)| *n >= 3).map(|(h, _)| h).collect();
+            detected.sort();
+            strip.extend(detected.iter().cloned());
             let options = Options {
                 repos: &repos,
                 all,
                 project: project_key.as_deref(),
                 since_days,
+                strip: &strip,
+                covered: &covered,
             };
-            let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-            let files = discover(&home, Some(&harness));
             let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
             let mut by_project: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
             let mut batch: Vec<Value> = Vec::new();
@@ -590,7 +659,15 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                 lines.push(format!("  {project}: {n}"));
             }
             lines.extend(preview.iter().cloned());
+            if replaced > 0 {
+                lines.push(format!("  replaced {replaced} entries an older importer made"));
+            }
+            for head in &detected {
+                lines.push(format!("  dropped a hook preamble that opened several sessions: \"{head}…\""));
+            }
             let why = |key: &str| match key {
+                "probe" => "agent prompts and probes (\"You are a … subagent\", \"hi\")",
+                "covered" => "projects that have curated notes (memory.notes)",
                 "unchanged" => "already imported, unchanged",
                 "outside" => "outside the profile's repositories (use --all to include them)",
                 "own" => "superagent or worker sessions (their tickets have summaries)",

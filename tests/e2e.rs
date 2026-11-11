@@ -608,8 +608,8 @@ fn an_imported_session_reaches_the_brief_of_the_next_ticket_in_that_repository()
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(
         other.join("p.jsonl"),
-        line(json!({ "type": "user", "cwd": "/somewhere/private", "message": { "role": "user", "content": "private thing" } }))
-            + &line(json!({ "type": "assistant", "message": { "role": "assistant", "content": "ok" } })),
+        line(json!({ "type": "user", "cwd": "/somewhere/private", "message": { "role": "user", "content": "Plan the migration of my private photo archive to the new disk" } }))
+            + &line(json!({ "type": "assistant", "message": { "role": "assistant", "content": "Copy by year with rsync, verify checksums, then switch the mount; nothing is deleted before that." } })),
     )
     .unwrap();
 
@@ -649,4 +649,161 @@ fn an_imported_session_reaches_the_brief_of_the_next_ticket_in_that_repository()
     let found = world.cli(&["memory", "search", "idempotency key", "--project", repo.to_str().unwrap()]);
     assert_eq!(found["hits"].as_array().unwrap().len(), 1);
     assert_eq!(found["semantic"], "hash:512");
+}
+
+#[test]
+fn imports_are_cleaned_of_hooks_probes_and_duplicates_and_curated_notes_take_their_place() {
+    let world = world("id = \"e2e\"\ncalibrated = true\n");
+    let repo = repo(&world);
+    world.cli(&["profile", "set", &format!("repos=[{{ path = \"{}\" }}]", repo.display()), "--yes"]);
+    let line = |value: Value| format!("{value}\n");
+    let exchange = |cwd: &Path, day: &str, ask: &str, answer: &str| {
+        line(
+            json!({ "type": "user", "cwd": cwd, "timestamp": format!("2026-10-{day}T09:00:00.000Z"), "message": { "role": "user", "content": ask } }),
+        ) + &line(json!({ "type": "assistant", "message": { "role": "assistant", "content": answer } }))
+    };
+    let claude = world.dir.path().join("home/.claude/projects/-invoices");
+    let pi = world.dir.path().join("home/.pi/agent/sessions/invoices");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::create_dir_all(&pi).unwrap();
+    let hook = "CAVEMAN MODE ACTIVE. Respond terse, drop articles.\n\n";
+    let asks = [
+        (
+            "01",
+            "Why does the nightly export time out on large tenants?",
+            "It loads every invoice into memory; stream the rows in batches of 5000 instead.",
+        ),
+        (
+            "02",
+            "Should the VAT column be gross or net in the export?",
+            "Net, with the rate in its own column, because the finance import recomputes gross.",
+        ),
+        (
+            "03",
+            "Rename the exporter module to writer and keep the old import path working",
+            "Renamed, with a re-export from the old path so callers keep working until the next release.",
+        ),
+    ];
+    for (day, ask, answer) in asks {
+        std::fs::write(
+            claude.join(format!("s-{day}.jsonl")),
+            exchange(&repo, day, &format!("{hook}{ask}"), answer),
+        )
+        .unwrap();
+    }
+    // The first conversation was driven from Pi, which recorded it too.
+    std::fs::write(
+        pi.join("p-01.jsonl"),
+        line(json!({ "type": "session", "id": "p-01", "timestamp": "2026-10-01T09:00:00.000Z", "cwd": repo }))
+            + &line(json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": asks[0].1 }] } }))
+            + &line(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "text", "text": asks[0].2 }] } })),
+    )
+    .unwrap();
+    std::fs::write(claude.join("probe.jsonl"), exchange(&repo, "04", "hi", "Hello! How can I help?")).unwrap();
+    std::fs::write(
+        claude.join("agent.jsonl"),
+        exchange(
+            &repo,
+            "05",
+            "You are a graphify extraction subagent. Read the files and return the nodes as JSON.",
+            "{\"nodes\": []} with a long explanation of every file that was read and what it holds",
+        ),
+    )
+    .unwrap();
+
+    let imported = world.cli(&["memory", "import"]);
+    assert_eq!(imported["skipped"]["probe"], 2, "{imported}");
+    assert_eq!(
+        world.cli(&["status"])["memory"],
+        3,
+        "three conversations, the one seen twice stored once"
+    );
+    let found = world.cli(&["memory", "search", "nightly export time out", "--project", repo.to_str().unwrap()]);
+    let hit = &found["hits"][0];
+    assert!(
+        hit["title"]
+            .as_str()
+            .unwrap()
+            .ends_with("Why does the nightly export time out on large tenants?"),
+        "{hit}"
+    );
+    let entry = world.cli(&["memory", "show", hit["id"].as_str().unwrap()]);
+    assert!(
+        !entry["body"].as_str().unwrap().contains("CAVEMAN"),
+        "the hook's preamble is not what was asked"
+    );
+    assert!(entry["body"].as_str().unwrap().contains("- folder: invoices"));
+
+    // The person's own notes for this repository: one fact per file, an index and a dropped folder.
+    let notes = world.dir.path().join("session-memory/out/invoices/notes");
+    std::fs::create_dir_all(notes.join("dropped")).unwrap();
+    std::fs::write(
+        notes.join("export-streams-in-batches.md"),
+        "---\nname: export-streams-in-batches\ndescription: The export must stream rows in batches of 5000\ntype: decision\nsessions: [s-01]\n---\n\nLoading every invoice into memory timed out for large tenants.\n",
+    )
+    .unwrap();
+    std::fs::write(notes.join("MEMORY.md"), "- [export](export-streams-in-batches.md)\n").unwrap();
+    std::fs::write(notes.join("dropped").join("noise.md"), "---\nname: noise\n---\nnot a fact\n").unwrap();
+    world.cli(&[
+        "profile",
+        "set",
+        &format!(
+            "memory.notes=[{{ path = \"{}\", project = \"{}\" }}]",
+            notes.parent().unwrap().display(),
+            repo.display()
+        ),
+    ]);
+    let synced = world.cli(&["memory", "notes"]);
+    assert_eq!(
+        (synced["added"].as_u64(), synced["sessions_removed"].as_u64()),
+        (Some(1), Some(3)),
+        "{synced}"
+    );
+    assert_eq!(world.cli(&["status"])["memory"], 1, "the notes took the sessions' place");
+    assert_eq!(world.cli(&["memory", "notes"])["unchanged"], 1);
+    let again = world.cli(&["memory", "import"]);
+    assert_eq!(again["imported"], 0, "{again}");
+    // A session that changes later is still not imported beside the notes.
+    std::fs::write(
+        claude.join("s-06.jsonl"),
+        exchange(
+            &repo,
+            "06",
+            "Add a currency column to the export file format",
+            "Added as ISO 4217 codes in a new last column, so older readers ignore it.",
+        ),
+    )
+    .unwrap();
+    let later = world.cli(&["memory", "import"]);
+    assert_eq!(
+        (later["imported"].as_u64(), later["skipped"]["covered"].as_u64()),
+        (Some(0), Some(1)),
+        "{later}"
+    );
+
+    // A ticket in that repository starts from the note.
+    let submitted = world.cli(&[
+        "submit",
+        "The export of a large tenant times out",
+        "--workflow",
+        "bugfix",
+        "--project",
+        repo.to_str().unwrap(),
+    ]);
+    let ticket_id = submitted["ticket_id"].as_str().unwrap().to_string();
+    let brief = world.wait("the brief", || {
+        let ticket = world.cli(&["ticket", &ticket_id]);
+        let pane = ticket["assignments"][0]["pane_id"].as_str()?.to_string();
+        let prompt = world.prompts(&pane).into_iter().find(|t| t.contains("start on ticket"))?;
+        std::fs::read_to_string(prompt.split_whitespace().nth(1)?).ok()
+    });
+    assert!(brief.contains("The export must stream rows in batches of 5000"), "{brief}");
+    // A note that is moved to dropped/ is forgotten.
+    std::fs::rename(
+        notes.join("export-streams-in-batches.md"),
+        notes.join("dropped").join("export-streams-in-batches.md"),
+    )
+    .unwrap();
+    assert_eq!(world.cli(&["memory", "notes"])["removed"], 1);
+    assert_eq!(world.cli(&["status"])["memory"], 0);
 }

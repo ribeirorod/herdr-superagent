@@ -85,6 +85,15 @@ repositories into memory (extractive, redacted, incremental), and
 `memory.semantic = true` finds entries by meaning as well as by words, with a
 built-in embedder or a local Ollama model. Nothing leaves the machine.
 
+If you already curate notes (one fact per markdown file, written by you or
+your own summariser), point the profile at the folder and they become the
+project's memory as they are: `profile set 'memory.notes[+]={ path =
+"~/notes/out/myrepo", project = "~/src/myrepo" }'`. `MEMORY.md` and
+`dropped/` are skipped, changed notes are re-read every five minutes, and
+the importer then leaves that project alone. `memory.backend = "claude-mem"`
+hands retrieval to claude-mem instead; ticket summaries are recorded either
+way.
+
 **Profiles move between machines.** With `state_repo.kind = "remote"` the
 profile directory is a private git repo of ticket records, event logs and
 summaries; one machine holds the lease, and `start` elsewhere pulls, takes

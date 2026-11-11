@@ -97,6 +97,9 @@ pub struct HarnessFlags {
     /// Flags the superagent session always starts with, per harness. The default
     /// takes Claude's own subagents away, so routing cannot turn into doing the work.
     pub session: std::collections::BTreeMap<String, Vec<String>>,
+    /// Environment variables exported into the session's and every worker's pane before the
+    /// harness starts (never secrets: the profile is plain text).
+    pub env: std::collections::BTreeMap<String, String>,
     /// Flags every worker starts with, per harness. The default takes Claude's own
     /// subagents away, so a worker delegates with `spawn`, where you can see it.
     pub worker: std::collections::BTreeMap<String, Vec<String>>,
@@ -118,6 +121,7 @@ impl Default for HarnessFlags {
         HarnessFlags {
             pre_trust: false,
             isolate_settings: false,
+            env: Default::default(),
             session: no_subagents.clone(),
             worker: no_subagents,
             autonomous,
@@ -241,6 +245,28 @@ pub struct Memory {
     /// command: a program that reads text on stdin and prints a JSON array of numbers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    /// `builtin`: the brief carries what this project's tickets and notes learned.
+    /// `claude-mem`: retrieval is left to claude-mem in the worker's harness; the brief
+    /// names the project to search and carries no memory of its own. Ticket summaries
+    /// are recorded either way: they are the ticket's record, and what moves between machines.
+    pub backend: String,
+    /// Folders of curated notes (one fact per markdown file) read into memory, per project.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<NotesSource>,
+    /// Leading text a hook puts in front of your prompts; `memory import` drops it.
+    /// Preambles that open several sessions are detected without being listed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub import_strip: Vec<String>,
+}
+
+/// A folder of notes someone (or a summariser) already wrote for a repository.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotesSource {
+    /// The folder with the `*.md` notes, or its parent when the notes are in `notes/`.
+    pub path: String,
+    /// The repository the notes are about (a path), or a project key.
+    pub project: String,
 }
 
 /// The per-profile state repository (PLAN §8a).
@@ -254,6 +280,20 @@ pub struct StateRepo {
 }
 
 impl HarnessFlags {
+    /// `NAME=value` exports for a pane: the profile's own, plus what the memory backend needs.
+    pub fn exports(&self, memory: &Memory) -> Vec<String> {
+        let mut env = self.env.clone();
+        if memory.backend == "claude-mem" {
+            // A ticket's worktree must land in its repository's project, not in one of its own.
+            env.entry("CLAUDE_MEM_PROJECT_NAME_SOURCE".into())
+                .or_insert_with(|| "git-remote".into());
+        }
+        env.into_iter()
+            .filter(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect()
+    }
+
     /// The flags a harness starts with besides its model and mode: `who` is `session` or `worker`.
     pub fn always(&self, harness: &str, who: &str, state_dir: &Path) -> Vec<String> {
         let table = if who == "session" { &self.session } else { &self.worker };
@@ -333,6 +373,9 @@ impl Default for Memory {
             model: "nomic-embed-text".into(),
             endpoint: "http://127.0.0.1:11434".into(),
             command: Vec::new(),
+            backend: "builtin".into(),
+            notes: Vec::new(),
+            import_strip: Vec::new(),
         }
     }
 }
@@ -409,6 +452,17 @@ impl Profile {
         }
         if self.memory.scope != "project" {
             return Err("memory.scope must be 'project' (memory never crosses projects)".into());
+        }
+        if !["builtin", "claude-mem"].contains(&self.memory.backend.as_str()) {
+            return Err(format!(
+                "memory.backend must be builtin or claude-mem, not '{}'",
+                self.memory.backend
+            ));
+        }
+        for notes in &self.memory.notes {
+            if notes.path.trim().is_empty() || notes.project.trim().is_empty() {
+                return Err("every [[memory.notes]] entry needs a path and a project".into());
+            }
         }
         if !["hash", "ollama", "command"].contains(&self.memory.embedder.as_str()) {
             return Err(format!(

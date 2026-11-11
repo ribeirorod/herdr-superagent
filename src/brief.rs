@@ -43,6 +43,8 @@ pub struct Extra {
     pub role_prompt: String,
     /// The profile's repositories: `(path, default branch, notes)`.
     pub repos: Vec<(String, String, String)>,
+    /// Set when retrieval is left to an external memory in the harness: `(its name, the project to search)`.
+    pub external_memory: Option<(String, String)>,
 }
 
 /// Where uncommitted work may sit: the person's own checkout of the ticket's repository.
@@ -123,7 +125,11 @@ pub fn render(
     } else {
         format!("## Notes\n\n{}\n", notes.join("\n"))
     };
-    let memory = if hits.is_empty() {
+    let memory = if let Some((name, project)) = &extra.external_memory {
+        format!(
+            "## Memory\n\nThis profile leaves retrieval to **{name}** in your harness. Before you plan, search it for this request, and always pass the project `{project}`: a search without a project reads other repositories' and other profiles' memory. Your session summary still goes through `herdr-superagent memory add`: it is this ticket's record."
+        )
+    } else if hits.is_empty() {
         "## Memory\n\nNo earlier tickets of this project are recorded yet.".to_string()
     } else {
         let lines: Vec<String> = hits
@@ -289,6 +295,7 @@ pub(crate) mod tests {
                 workflow_steps: "## Workflow: feature\n\n1. plan".into(),
                 role_prompt: "You own the ticket.".into(),
                 repos: vec![("/src/api".into(), "main".into(), "the API".into())],
+                external_memory: None,
             },
         );
         assert!(text.contains("## Workflow: feature") && text.contains("## Your role: worker"));

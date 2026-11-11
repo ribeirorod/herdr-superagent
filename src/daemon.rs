@@ -104,6 +104,7 @@ pub(crate) struct Daemon {
     pub(crate) last_commit: Cell<Instant>,
     pub(crate) last_renew: Cell<Instant>,
     pub(crate) last_tidy: Cell<Instant>,
+    pub(crate) last_notes: Cell<Instant>,
     /// Finished source polls come back here from their threads.
     pub(crate) polled: (
         std::sync::mpsc::Sender<crate::sources::Polled>,
@@ -202,6 +203,7 @@ pub fn run(profile_name: &str) -> Result<(), String> {
         last_commit: Cell::new(Instant::now()),
         last_renew: Cell::new(Instant::now()),
         last_tidy: Cell::new(Instant::now()),
+        last_notes: Cell::new(Instant::now() - Duration::from_secs(600)),
         polled: std::sync::mpsc::channel(),
         needs_you_seen: Cell::new(0),
         profile_mtime: Cell::new(profile_mtime),
@@ -432,6 +434,11 @@ impl Daemon {
         }
         self.drain_effects();
         self.observe_workers();
+        // Curated notes are re-read every five minutes; unchanged files cost a stat each.
+        if self.last_notes.get().elapsed() >= Duration::from_secs(300) && !self.policy.snapshot().memory.notes.is_empty() {
+            self.last_notes.set(Instant::now());
+            self.sync_notes();
+        }
         self.embed_backlog();
         self.announce();
         self.auto_tidy();
@@ -799,6 +806,21 @@ impl Daemon {
                     .collect(),
             )),
             "memory_import" => self.memory_import(params),
+            "notes_sync" => {
+                self.last_notes.set(Instant::now());
+                Ok(self.sync_notes())
+            }
+            // A changed importer replaces what an older one stored.
+            "memory_forget_sessions" => {
+                let ids = self.store.memory_forget_sessions(None)?;
+                for (key, _) in self.store.kv_prefix("import.") {
+                    self.store.kv_set(&key, "");
+                }
+                if let Some(repo) = self.state_repo.borrow().as_ref() {
+                    repo.remove_memory_files(&ids);
+                }
+                Ok(json!({ "removed": ids.len() }))
+            }
             "profile" => {
                 let mut value = serde_json::to_value(self.policy.snapshot())?;
                 value["profile_path"] = json!(self.paths.profile_file());
