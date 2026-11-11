@@ -230,7 +230,17 @@ pub struct Routing {
 #[serde(default)]
 pub struct Memory {
     pub scope: String,
+    /// Search by meaning as well as by words (a vector per entry, local only).
     pub semantic: bool,
+    /// `hash` (built in, no model), `ollama` (a local Ollama server) or `command` (a local program).
+    pub embedder: String,
+    /// ollama: the embedding model.
+    pub model: String,
+    /// ollama: where the server listens.
+    pub endpoint: String,
+    /// command: a program that reads text on stdin and prints a JSON array of numbers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
 }
 
 /// The per-profile state repository (PLAN §8a).
@@ -311,6 +321,10 @@ impl Default for Memory {
         Memory {
             scope: "project".into(),
             semantic: false,
+            embedder: "hash".into(),
+            model: "nomic-embed-text".into(),
+            endpoint: "http://127.0.0.1:11434".into(),
+            command: Vec::new(),
         }
     }
 }
@@ -387,6 +401,33 @@ impl Profile {
         }
         if self.memory.scope != "project" {
             return Err("memory.scope must be 'project' (memory never crosses projects)".into());
+        }
+        if !["hash", "ollama", "command"].contains(&self.memory.embedder.as_str()) {
+            return Err(format!(
+                "memory.embedder must be hash, ollama or command, not '{}'",
+                self.memory.embedder
+            ));
+        }
+        if self.memory.embedder == "command" && self.memory.command.is_empty() {
+            return Err("memory.embedder = \"command\" needs memory.command = [\"program\", …]".into());
+        }
+        if self.memory.embedder == "ollama" {
+            // Embeddings carry the text: only a local server is allowed.
+            let host = self
+                .memory
+                .endpoint
+                .split("://")
+                .nth(1)
+                .unwrap_or("")
+                .split(['/', ':'])
+                .next()
+                .unwrap_or("");
+            if !["127.0.0.1", "localhost", "[::1]", "::1"].contains(&host) {
+                return Err(format!(
+                    "memory.endpoint must be a local server (127.0.0.1 or localhost), not '{}'",
+                    self.memory.endpoint
+                ));
+            }
         }
         for repo in &self.repos {
             if repo.path.trim().is_empty() {

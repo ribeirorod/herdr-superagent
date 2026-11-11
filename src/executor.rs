@@ -436,8 +436,20 @@ impl Daemon {
                 .or_else(|| ticket.execution.as_ref().and_then(|e| e.base_reason.clone())),
         });
         let project_key = self.ticket_project(&ticket);
-        let hits = self.store.memory_search(&project_key, &ticket.title, 5).unwrap_or_default();
         let request = self.store.request_get(&ticket.origin.request_id);
+        // What this project's earlier tickets and sessions learned about this request, by words and by meaning.
+        let question = format!(
+            "{}\n{}",
+            ticket.title,
+            request
+                .as_ref()
+                .map(|r| r.text.chars().take(600).collect::<String>())
+                .unwrap_or_default()
+        );
+        let hits = self
+            .store
+            .memory_search_hybrid(&project_key, &question, 5, self.embedder().as_ref())
+            .unwrap_or_default();
         let extra = brief::Extra {
             workflow_steps: chosen_pack.as_ref().map(|c| c.brief_section(&role)).unwrap_or_default(),
             role_prompt: chosen_pack

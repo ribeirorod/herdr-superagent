@@ -88,6 +88,7 @@ impl SqliteStore {
         )?;
         drop(conn);
         self.memory_migrate()?;
+        self.vector_migrate()?;
         let conn = self.conn.borrow();
         let version: Option<i64> = conn
             .query_row("SELECT value FROM kv WHERE key = 'schema'", [], |row| row.get::<_, String>(0))
@@ -162,6 +163,18 @@ impl SqliteStore {
             .optional()
             .ok()
             .flatten()
+    }
+
+    /// Every key that starts with `prefix`, with its value.
+    pub fn kv_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+        let conn = self.conn.borrow();
+        let Ok(mut statement) = conn.prepare("SELECT key, value FROM kv WHERE substr(key, 1, ?2) = ?1") else {
+            return Vec::new();
+        };
+        statement
+            .query_map(params![prefix, prefix.len() as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 
     pub fn kv_set(&self, key: &str, value: &str) {

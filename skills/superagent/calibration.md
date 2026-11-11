@@ -101,6 +101,36 @@ propose a **private repo on the company's own host**, never a personal account,
 because tickets hold company data. Write `state_repo.kind`, `state_repo.remote`
 and `state_repo.branch`.
 
+## Step 4b: memory
+
+Memory is per project and local. Two questions:
+
+- **Search by meaning** (`memory.semantic = true`): besides exact words,
+  entries are found by similarity. The default embedder is built in and needs
+  no model. With a local Ollama server, `memory.embedder = "ollama"` and
+  `memory.model = "nomic-embed-text"` give real semantic search; nothing
+  leaves the machine either way.
+- **Earlier sessions**: the person's past Claude Code, Codex and Pi sessions
+  in this profile's repositories can become memory, so the first ticket in a
+  repository does not start from nothing. Show them what it would take with
+  `herdr-superagent memory import --dry-run`, and run
+  `herdr-superagent memory import` when they agree. It is extractive (what
+  was asked, the last answer, the files changed), redacted, and never copies
+  a transcript. Running it again later only picks up new sessions.
+
+## Step 4c: sources
+
+Ask where work arrives from besides them typing: issues assigned to them,
+review requests, a mailbox. Each becomes a `[[sources]]` entry; the person
+adds it (sources are protected), for example:
+
+`herdr-superagent --profile {profile_name} profile set 'sources[+]={ id = "issues", kind = "github", repo = "owner/name", query = "assignee:@me", project = "~/src/name", workflow = "bugfix" }' --yes`
+
+Kinds: `github` (the `gh` CLI), `command` (any program printing JSON items,
+for Jira or Bitbucket CLIs), `session` (you look through your MCP servers
+when the daemon asks; needs `instructions`). `herdr-superagent sources`
+shows how each one is fetched on this machine.
+
 ## Step 5: write
 
 Write everything you may write with one or more

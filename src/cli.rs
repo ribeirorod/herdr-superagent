@@ -243,6 +243,24 @@ pub enum MemoryAction {
     },
     /// Print one memory entry in full.
     Show { id: String },
+    /// Turn your earlier Claude Code, Codex and Pi sessions into project memory (extractive, redacted, incremental).
+    Import {
+        /// claude, codex, pi or all.
+        #[arg(long, default_value = "all")]
+        harness: String,
+        /// Only sessions of this repository (a path or a project key).
+        #[arg(long)]
+        project: Option<String>,
+        /// Also sessions outside the profile's repositories.
+        #[arg(long)]
+        all: bool,
+        /// Only sessions changed in the last N days.
+        #[arg(long)]
+        since_days: Option<u64>,
+        /// Show what would be imported without storing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -484,6 +502,107 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                     value["title"].as_str().unwrap_or(""),
                     value["body"].as_str().unwrap_or("")
                 ),
+            )
+        }
+        Command::Memory {
+            action:
+                MemoryAction::Import {
+                    harness,
+                    project,
+                    all,
+                    since_days,
+                    dry_run,
+                },
+        } => {
+            use crate::importer::{consider, discover, Options, Outcome};
+            let settings = daemon("profile", json!({}))?;
+            let repos: Vec<String> = settings["repos"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|r| r["path"].as_str())
+                        .map(crate::profile::expand_home)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let marks = daemon("import_marks", json!({}))?;
+            let project_key = project.map(|p| crate::memory::project_key(&p).unwrap_or(p));
+            let options = Options {
+                repos: &repos,
+                all,
+                project: project_key.as_deref(),
+                since_days,
+            };
+            let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+            let files = discover(&home, Some(&harness));
+            let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            let mut by_project: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            let mut batch: Vec<Value> = Vec::new();
+            let mut batch_marks = serde_json::Map::new();
+            let mut imported = 0usize;
+            let mut preview: Vec<String> = Vec::new();
+            let flush = |batch: &mut Vec<Value>, batch_marks: &mut serde_json::Map<String, Value>| -> Result<(), String> {
+                if !batch.is_empty() && !dry_run {
+                    daemon(
+                        "memory_import",
+                        json!({ "entries": std::mem::take(batch), "marks": std::mem::take(batch_marks) }),
+                    )?;
+                }
+                batch.clear();
+                batch_marks.clear();
+                Ok(())
+            };
+            for (name, file) in &files {
+                let known = marks.get(file.display().to_string()).and_then(Value::as_str);
+                match consider(name, file, known, &options) {
+                    Outcome::Import(entry, stamp) => {
+                        imported += 1;
+                        *by_project.entry(entry.project.clone()).or_default() += 1;
+                        if dry_run {
+                            preview.push(format!("  {:<28} {}", entry.project, entry.title));
+                        }
+                        batch.push(serde_json::to_value(&*entry).map_err(|e| e.to_string())?);
+                        batch_marks.insert(file.display().to_string(), Value::String(stamp));
+                        if batch.len() >= 20 {
+                            flush(&mut batch, &mut batch_marks)?;
+                        }
+                    }
+                    Outcome::Skip(skip) => {
+                        let name = serde_json::to_value(skip)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        *skipped.entry(name).or_default() += 1;
+                    }
+                }
+            }
+            flush(&mut batch, &mut batch_marks)?;
+            let mut lines = vec![format!(
+                "{} {imported} session(s) from {} transcript file(s)",
+                if dry_run { "would import" } else { "imported" },
+                files.len()
+            )];
+            for (project, n) in &by_project {
+                lines.push(format!("  {project}: {n}"));
+            }
+            lines.extend(preview.iter().cloned());
+            let why = |key: &str| match key {
+                "unchanged" => "already imported, unchanged",
+                "outside" => "outside the profile's repositories (use --all to include them)",
+                "own" => "superagent or worker sessions (their tickets have summaries)",
+                "empty" => "nothing asked or nothing answered",
+                "too_old" => "older than --since-days",
+                _ => "unreadable or too large",
+            };
+            for (key, n) in &skipped {
+                lines.push(format!("  skipped {n}: {}", why(key)));
+            }
+            if imported > 0 && !dry_run {
+                lines.push("search it with `herdr-superagent memory search \"…\" --project <repo path>`; workers get the matching entries in their brief".to_string());
+            }
+            out(
+                json!({ "imported": imported, "files": files.len(), "projects": by_project, "skipped": skipped, "dry_run": dry_run }),
+                lines.join("\n"),
             )
         }
         Command::Logs { process, lines, follow } => {

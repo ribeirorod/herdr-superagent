@@ -375,8 +375,17 @@ impl StateRepo {
 
     /// Writes a note outside any ticket: `memory/<project>/notes/<id>.md`.
     pub fn write_note(&self, entry: &crate::memory::MemoryEntry) -> Result<PathBuf, String> {
+        self.write_memory_file(entry, "notes")
+    }
+
+    /// An imported session's summary, beside the project's notes: text only, never the transcript.
+    pub fn write_session(&self, entry: &crate::memory::MemoryEntry) -> Result<PathBuf, String> {
+        self.write_memory_file(entry, "sessions")
+    }
+
+    fn write_memory_file(&self, entry: &crate::memory::MemoryEntry, kind: &str) -> Result<PathBuf, String> {
         let project: String = entry.project.chars().map(|c| if c == '/' { '_' } else { c }).collect();
-        let dir = self.dir.join("memory").join(project).join("notes");
+        let dir = self.dir.join("memory").join(project).join(kind);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{}.md", entry.id));
         let text = format!(

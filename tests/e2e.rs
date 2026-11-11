@@ -582,3 +582,67 @@ fn an_autonomous_worker_is_held_at_a_risky_command_until_a_person_approves_it() 
     let again = run(&["push", "origin", "main"]);
     assert_eq!(again.status.code(), Some(75), "the approval was for one run");
 }
+
+#[test]
+fn an_imported_session_reaches_the_brief_of_the_next_ticket_in_that_repository() {
+    let world = world("id = \"e2e\"\ncalibrated = true\n\n[memory]\nsemantic = true\n");
+    let repo = repo(&world);
+    world.cli(&["profile", "set", &format!("repos=[{{ path = \"{}\" }}]", repo.display()), "--yes"]);
+    // A session the person had by hand, before the superagent existed.
+    let sessions = world.dir.path().join("home/.claude/projects/-invoices");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let line = |value: Value| format!("{value}\n");
+    let transcript = line(
+        json!({ "type": "user", "sessionId": "old-1", "cwd": repo, "timestamp": "2026-10-01T09:00:00.000Z",
+            "message": { "role": "user", "content": "Why do retried exports duplicate invoice rows?" } }),
+    ) + &line(json!({ "type": "assistant", "message": { "role": "assistant", "content": [
+            { "type": "text", "text": "The exporter retried without an idempotency key, so each retry appended the rows again. Fixed in export/writer.rs by keying on invoice id." },
+            { "type": "tool_use", "name": "Edit", "input": { "file_path": repo.join("export/writer.rs") } } ] } }));
+    std::fs::write(sessions.join("old-1.jsonl"), transcript).unwrap();
+    // Elsewhere on the machine: not this profile's business.
+    let other = world.dir.path().join("home/.claude/projects/-private");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("p.jsonl"),
+        line(json!({ "type": "user", "cwd": "/somewhere/private", "message": { "role": "user", "content": "private thing" } }))
+            + &line(json!({ "type": "assistant", "message": { "role": "assistant", "content": "ok" } })),
+    )
+    .unwrap();
+
+    let dry = world.cli(&["memory", "import", "--dry-run"]);
+    assert_eq!(dry["imported"], 1);
+    assert_eq!(world.cli(&["status"])["memory"], 0, "a dry run stores nothing");
+    let imported = world.cli(&["memory", "import"]);
+    assert_eq!(imported["imported"], 1, "{imported}");
+    assert_eq!(imported["skipped"]["outside"], 1);
+    let again = world.cli(&["memory", "import"]);
+    assert_eq!(
+        (again["imported"].as_u64(), again["skipped"]["unchanged"].as_u64()),
+        (Some(0), Some(1))
+    );
+
+    // The next ticket in that repository: its brief carries what the old session learned,
+    // found although the request shares no exact word form with it ("retry" vs "retried", "duplicated" vs "duplicate").
+    let submitted = world.cli(&[
+        "submit",
+        "Duplicated rows after an export retry",
+        "--workflow",
+        "bugfix",
+        "--project",
+        repo.to_str().unwrap(),
+    ]);
+    let ticket_id = submitted["ticket_id"].as_str().unwrap().to_string();
+    let brief = world.wait("the brief", || {
+        let ticket = world.cli(&["ticket", &ticket_id]);
+        let pane = ticket["assignments"][0]["pane_id"].as_str()?.to_string();
+        let prompt = world.prompts(&pane).into_iter().find(|t| t.contains("start on ticket"))?;
+        std::fs::read_to_string(prompt.split_whitespace().nth(1)?).ok()
+    });
+    assert!(
+        brief.contains("claude session 2026-10-01: Why do retried exports duplicate invoice rows?"),
+        "{brief}"
+    );
+    let found = world.cli(&["memory", "search", "idempotency key", "--project", repo.to_str().unwrap()]);
+    assert_eq!(found["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(found["semantic"], "hash:512");
+}

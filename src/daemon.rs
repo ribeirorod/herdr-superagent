@@ -429,6 +429,7 @@ impl Daemon {
         }
         self.drain_effects();
         self.observe_workers();
+        self.embed_backlog();
         self.announce();
         self.auto_tidy();
         self.watch_profile();
@@ -787,6 +788,14 @@ impl Daemon {
             "memory_add" => self.memory_add(params),
             "memory_get" => Ok(serde_json::to_value(self.store.memory_get(str_param(params, "id")?))?),
             "memory_search" => self.memory_search(params),
+            "import_marks" => Ok(Value::Object(
+                self.store
+                    .kv_prefix("import.")
+                    .into_iter()
+                    .map(|(k, v)| (k.trim_start_matches("import.").to_string(), Value::String(v)))
+                    .collect(),
+            )),
+            "memory_import" => self.memory_import(params),
             "profile" => {
                 let mut value = serde_json::to_value(self.policy.snapshot())?;
                 value["profile_path"] = json!(self.paths.profile_file());
@@ -923,6 +932,22 @@ impl Daemon {
         crate::memory::NOTES_PROJECT.to_string()
     }
 
+    /// The profile's embedder, when semantic memory is on.
+    pub(crate) fn embedder(&self) -> Option<crate::embed::Embedder> {
+        let memory = self.policy.snapshot().memory;
+        memory.semantic.then(|| crate::embed::Embedder::new(&memory))
+    }
+
+    /// A few missing vectors per tick, so turning semantic memory on (or importing sessions) never stalls the daemon.
+    fn embed_backlog(&self) {
+        if let Some(embedder) = self.embedder() {
+            let written = self.store.vector_backfill(&embedder, 16);
+            if written > 0 {
+                tracing::debug!(written, model = %embedder.name, "embedded memory entries");
+            }
+        }
+    }
+
     fn memory_add(&self, params: &Value) -> Handler {
         let title = str_param(params, "title")?;
         let body = str_param(params, "body")?;
@@ -949,12 +974,34 @@ impl Daemon {
         Ok(json!({ "id": entry.id, "project": entry.project, "ticket_id": entry.ticket_id, "file": file }))
     }
 
+    /// Stores a batch of imported session summaries with the marks of the files they came from.
+    fn memory_import(&self, params: &Value) -> Handler {
+        let entries: Vec<crate::memory::MemoryEntry> = serde_json::from_value(params.get("entries").cloned().unwrap_or(json!([])))?;
+        let mut stored = 0;
+        for entry in &entries {
+            let entry = self.store.memory_add(entry)?;
+            stored += 1;
+            if let Some(repo) = self.state_repo.borrow().as_ref() {
+                if let Err(e) = repo.write_session(&entry) {
+                    tracing::warn!(%e, "could not write the session summary file");
+                }
+            }
+        }
+        if let Some(marks) = params.get("marks").and_then(Value::as_object) {
+            for (file, mark) in marks {
+                self.store.kv_set(&format!("import.{file}"), mark.as_str().unwrap_or(""));
+            }
+        }
+        Ok(json!({ "stored": stored }))
+    }
+
     fn memory_search(&self, params: &Value) -> Handler {
         let project = self.memory_project(params);
         let query = params.get("query").and_then(Value::as_str).unwrap_or("");
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
-        let hits = self.store.memory_search(&project, query, limit)?;
-        Ok(json!({ "project": project, "hits": hits }))
+        let embedder = self.embedder();
+        let hits = self.store.memory_search_hybrid(&project, query, limit, embedder.as_ref())?;
+        Ok(json!({ "project": project, "hits": hits, "semantic": embedder.map(|e| e.name) }))
     }
 
     fn submit(&self, params: &Value) -> Handler {

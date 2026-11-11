@@ -10,6 +10,7 @@ mod cli;
 mod core;
 mod daemon;
 mod dashboard;
+mod embed;
 mod ensure;
 mod envpath;
 mod executor;
@@ -18,6 +19,7 @@ mod guard;
 // Pane and workspace fields that phase 2's observer reads.
 #[allow(dead_code)]
 mod herdr;
+mod importer;
 mod ipc;
 mod logging;
 mod memory;
