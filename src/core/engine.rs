@@ -162,6 +162,15 @@ impl Engine {
         self.atomic(|| self.note_inner(ticket_id, text))
     }
 
+    pub fn retitle(&self, ticket_id: &str, title: &str) -> Result<Ticket, UserError> {
+        self.atomic(|| self.retitle_inner(ticket_id, title))
+    }
+
+    /// Send the waiting checkpoint back to the worker with what must change.
+    pub fn request_changes(&self, ticket_id: &str, comment: &str) -> Result<Ticket, UserError> {
+        self.atomic(|| self.request_changes_inner(ticket_id, comment))
+    }
+
     /// Ask a worker that waits for its status; any other worker is left alone.
     pub fn request_status(&self, ticket_id: &str) -> Result<bool, UserError> {
         self.atomic(|| self.request_status_inner(ticket_id))

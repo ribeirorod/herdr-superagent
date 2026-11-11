@@ -1,0 +1,6 @@
+id = "general"
+description = "One worker, plan first."
+steps = [
+  { role = "worker", goal = "Investigate and write the plan", checkpoint = "plan" },
+  { role = "worker", goal = "Do the work and verify it" },
+]

@@ -28,6 +28,16 @@ pub trait Policy {
     fn eval_timeout_ms(&self) -> i64;
     /// The mode a ticket runs in: the request's or the superagent's proposal, capped by the profile's rules.
     fn mode_for(&self, request: &Request, proposed: Option<Mode>) -> Mode;
+    /// The workflow a ticket runs under and what it demands; a named workflow wins, else the policy chooses.
+    fn plan_for(&self, request: &Request, workflow: Option<&str>, _title: &str) -> WorkPlan {
+        let _ = request;
+        WorkPlan {
+            workflow: workflow.map(str::to_string),
+            pack: None,
+            root_role: "worker".into(),
+            required_checkpoints: Vec::new(),
+        }
+    }
 }
 
 /// What the superagent session decides about a candidate.
@@ -143,10 +153,45 @@ pub enum DomainEvent {
     CheckpointReached {
         ticket_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+        /// It replaced a checkpoint that was still waiting (a revised plan).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        revised: bool,
     },
     CheckpointApproved {
         ticket_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
+    },
+    /// A person sent a checkpoint back instead of approving it.
+    ChangesRequested {
+        ticket_id: String,
+        name: String,
+        comment: String,
+    },
+    /// A worker's report, so the record tells the whole story.
+    Reported {
+        ticket_id: String,
+        assignment_id: String,
+        role: String,
+        state: ReportState,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+    },
+    /// Context or a follow-up that reached the ticket: `note`, `request`, `spawn`.
+    InputAdded {
+        ticket_id: String,
+        kind: String,
+        text: String,
+    },
+    Retitled {
+        ticket_id: String,
+        from: String,
+        to: String,
     },
     RequestRequeued {
         request_id: String,

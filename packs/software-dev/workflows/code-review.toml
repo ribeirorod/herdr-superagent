@@ -1,0 +1,7 @@
+id = "code-review"
+description = "Review a branch or pull request; nothing is changed."
+match = { keywords = ["review", "pull request", "pr ", "merge request", "diff"] }
+steps = [
+  { role = "reviewer", goal = "Read the change and its context; run its tests" },
+  { role = "reviewer", goal = "Report findings by severity with file and line" },
+]

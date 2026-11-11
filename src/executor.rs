@@ -118,10 +118,11 @@ pub fn mode_flags(profile: &Profile, harness: &str, mode: Mode) -> Vec<String> {
 
 /// The harness and model for a role: the first installed entry of the role's
 /// tier, else the superagent's own harness.
-pub fn pick_tier(profile: &Profile, role: &str) -> (String, String) {
-    let tier = match role {
-        "reviewer" => &profile.models.review.use_,
-        "small" => &profile.models.small.use_,
+pub fn pick_tier(profile: &Profile, role: &str, pack_tier: &str) -> (String, String) {
+    // The pack's tier for the role wins; without one, a reviewer reviews and the rest is hard work.
+    let tier = match (pack_tier, role) {
+        ("review", _) | ("", "reviewer") => &profile.models.review.use_,
+        ("small", _) | ("", "small") => &profile.models.small.use_,
         _ => &profile.models.hard.use_,
     };
     for entry in tier {
@@ -232,6 +233,7 @@ impl Daemon {
         self.handlers.insert("launch", Box::new(|d, e| d.launch(e)));
         self.handlers.insert("deliver", Box::new(|d, e| d.deliver(e)));
         self.handlers.insert("stop", Box::new(|d, e| d.stop_worker(e)));
+        self.handlers.insert("session", Box::new(|d, e| d.session_effect(e)));
     }
 
     fn running_workers(&self) -> usize {
@@ -281,7 +283,21 @@ impl Daemon {
             return Outcome::Done;
         }
         let role = assignment.role.clone();
-        let (harness, model) = pick_tier(&profile, &role);
+        // The ticket's workflow pack says which tier runs this role and what the role is told.
+        let packs = self.policy.packs();
+        let chosen_pack = ticket.workflow.as_deref().and_then(|w| crate::packs::find(&packs, w)).or_else(|| {
+            ticket
+                .pack
+                .as_deref()
+                .and_then(|label| label.rsplit('/').next())
+                .and_then(|w| crate::packs::find(&packs, w))
+        });
+        let tier = chosen_pack
+            .as_ref()
+            .and_then(|c| c.role(&role))
+            .map(|r| r.tier.clone())
+            .unwrap_or_default();
+        let (harness, model) = pick_tier(&profile, &role, &tier);
         let label = workspace_label(&ticket.title, &ticket.id);
         let tab = tab_label(&ticket, &assignment.id);
 
@@ -422,12 +438,21 @@ impl Daemon {
         let project_key = self.ticket_project(&ticket);
         let hits = self.store.memory_search(&project_key, &ticket.title, 5).unwrap_or_default();
         let request = self.store.request_get(&ticket.origin.request_id);
-        let text = brief::render(&self.paths.profile, &ticket, request.as_ref(), &assignment, &hits);
-        let brief_path =
-            self.paths
-                .state_dir()
-                .join("briefs")
-                .join(format!("{}-{}.md", ticket.id, &assignment.id[..8.min(assignment.id.len())]));
+        let extra = brief::Extra {
+            workflow_steps: chosen_pack.as_ref().map(|c| c.brief_section(&role)).unwrap_or_default(),
+            role_prompt: chosen_pack
+                .as_ref()
+                .and_then(|c| c.role(&role))
+                .map(|r| r.prompt.clone())
+                .unwrap_or_default(),
+            repos: profile
+                .repos
+                .iter()
+                .map(|r| (crate::profile::expand_home(&r.path), r.default_branch.clone(), r.notes.clone()))
+                .collect(),
+        };
+        let text = brief::render(&self.paths.profile, &ticket, request.as_ref(), &assignment, &hits, &extra);
+        let brief_path = self.brief_path(&ticket.id, &assignment.id);
         if let Some(parent) = brief_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -452,6 +477,7 @@ impl Daemon {
             format!("SUPERAGENT_PROFILE={}", self.paths.profile),
             format!("PATH={worker_path}"),
             format!("SUPERAGENT_WORKTREE={directory}"),
+            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false".to_string(),
         ];
         for key in [
             "HERDR_SUPERAGENT_STATE_DIR",
@@ -471,6 +497,7 @@ impl Daemon {
         std::thread::sleep(Duration::from_millis(300));
 
         let mut args = crate::calibration::model_args(&harness, &model);
+        args.extend(profile.harness_flags.always(&harness, "worker"));
         args.extend(mode_flags(&profile, &harness, effective_mode));
         let name = worker_name(&self.paths.profile, &ticket.id, &tab);
         if let Err(e) = herdr.call(
@@ -514,9 +541,15 @@ impl Daemon {
         let _ = self.engine.assignment_placed(&ticket.id, &assignment.id, &pane_id);
         let _ = self.engine.assignment_started(&ticket.id, &assignment.id);
         // The first delivery carries the brief pointer even when nothing else waits.
+        // A child has its own delivery, so it cannot be replaced by one for the root.
+        let deliver_key = if assignment.is_root() {
+            ticket.id.clone()
+        } else {
+            format!("{}:{}", ticket.id, assignment.id)
+        };
         self.store.effect_enqueue(
             "deliver",
-            &ticket.id,
+            &deliver_key,
             &json!({ "ticket_id": ticket.id, "assignment_id": assignment.id }),
             crate::herdr::seq_now() as i64 + 2000,
             &crate::core::clock::now_iso(),
@@ -544,6 +577,11 @@ impl Daemon {
         if !ticket.live() {
             return Outcome::Done;
         }
+        // A child's first delivery: its own brief, in its own pane.
+        let named = effect.payload["assignment_id"].as_str().unwrap_or("");
+        if let Some(child) = ticket.assignments.iter().find(|a| a.id == named && !a.is_root()).cloned() {
+            return self.deliver_child_brief(&ticket, &child);
+        }
         let Some(running) = ticket.running_assignment().cloned() else {
             return Outcome::Defer(5_000);
         };
@@ -551,11 +589,7 @@ impl Daemon {
             return Outcome::Defer(5_000);
         };
         let Some(herdr) = &self.herdr else { return Outcome::Defer(60_000) };
-        let brief = running
-            .delivered_at
-            .is_none()
-            .then(|| ticket.execution.as_ref().map(|e| std::path::PathBuf::from(&e.assignment)))
-            .flatten();
+        let brief = running.delivered_at.is_none().then(|| self.brief_path(&ticket.id, &running.id));
         let (text, ids) = brief::delivery_text(&ticket, &|id| self.store.request_get(id), brief.as_deref());
         if text.trim().is_empty() {
             return Outcome::Done;
@@ -576,6 +610,44 @@ impl Daemon {
                 }
                 let _ = self.engine.delivery_failed(&ticket_id, &running.id, &msg);
                 Outcome::Fail(format!("agent.prompt: {msg}"))
+            }
+        }
+    }
+
+    fn brief_path(&self, ticket_id: &str, assignment_id: &str) -> std::path::PathBuf {
+        self.paths
+            .state_dir()
+            .join("briefs")
+            .join(format!("{ticket_id}-{}.md", &assignment_id[..8.min(assignment_id.len())]))
+    }
+
+    fn deliver_child_brief(&self, ticket: &Ticket, child: &Assignment) -> Outcome {
+        if child.state != AssignmentState::Running || child.delivered_at.is_some() {
+            return Outcome::Done;
+        }
+        let (Some(pane_id), Some(herdr)) = (child.pane_id.clone(), &self.herdr) else {
+            return Outcome::Defer(5_000);
+        };
+        let text = format!(
+            "Read {} and do the task it gives you for ticket {}.",
+            self.brief_path(&ticket.id, &child.id).display(),
+            ticket.id
+        );
+        match herdr.call("agent.prompt", json!({ "target": pane_id, "text": text })) {
+            Ok(_) => {
+                let _ = self.engine.inputs_delivered(&ticket.id, &child.id, &[]);
+                tracing::info!(target: "executor", ticket = %ticket.id, pane = %pane_id, role = %child.role, "child briefed");
+                Outcome::Done
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("agent_blocked") {
+                    Outcome::Defer(30_000)
+                } else if msg.contains("agent_not_ready") || msg.contains("not an active") || msg.contains("launch") {
+                    Outcome::Defer(5_000)
+                } else {
+                    Outcome::Fail(format!("agent.prompt child: {msg}"))
+                }
             }
         }
     }
@@ -920,8 +992,8 @@ mod tests {
                 model: "fast".into(),
             },
         ];
-        assert_eq!(pick_tier(&profile, "worker"), ("sh".into(), "fast".into()));
-        assert_eq!(pick_tier(&profile, "reviewer").1, "sonnet", "the default review tier");
+        assert_eq!(pick_tier(&profile, "worker", ""), ("sh".into(), "fast".into()));
+        assert_eq!(pick_tier(&profile, "reviewer", "").1, "sonnet", "the default review tier");
         assert_eq!(
             mode_flags(&profile, "claude", Mode::Autonomous),
             vec!["--dangerously-skip-permissions"]

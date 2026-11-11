@@ -13,6 +13,10 @@ person works and to write it down.
 The `herdr-superagent` binary is at `{bin}`. If the bare name is not found in
 your shell, use that path.
 
+Every command you print for the person to run must carry
+`--profile {profile_name}`: their shell does not know which profile you are,
+and a bare command lands in the default profile.
+
 ## Step 1: inventory
 
 Run `herdr-superagent doctor --json`. It tells you which harnesses are
@@ -54,7 +58,7 @@ Ask how many workers may run at once (`limits.max_workers`, propose 3).
 
 **You cannot change `modes`, `repos`, `limits` or `routing` yourself.** Those
 affect how much review a request gets. Print the exact
-`herdr-superagent profile set … --yes` command for the person to run in their
+`herdr-superagent --profile {profile_name} profile set … --yes` command for the person to run in their
 own shell, and wait until `herdr-superagent profile` shows the change.
 
 ## Step 3b: trust for worker worktrees
@@ -70,6 +74,24 @@ the person answers. Explain the trade-off and ask:
   they answer it in the pane.
 
 Write their choice with `profile set harness_flags.pre_trust=true|false`.
+
+## Step 3c: their global harness settings
+
+The session and the workers start the harness the person also uses by hand,
+so their global settings apply here too: output styles, hooks, personal
+instructions. That can bend a worker's reports or run hooks in every pane.
+Ask whether workers should start clean:
+
+- `harness_flags.isolate_settings = true`: Claude loads project and local
+  settings only (`--setting-sources project,local`). Their global style and
+  hooks stay out; anything the global settings provide that work needs
+  (environment variables, permissions) must then live in the project.
+- `false` (default): global settings apply everywhere.
+
+Write their choice with `profile set harness_flags.isolate_settings=true|false`.
+Subagents of the harness are already off for the session and the workers
+(`harness_flags.session`, `harness_flags.worker`), so delegation always
+happens in herdr panes where it can be seen.
 
 ## Step 4: state repo
 
@@ -88,9 +110,14 @@ profile directory (`herdr-superagent profile --json` prints the path as
 `profile_path`): what you learned, in prose, so a future session can read it.
 Finish with `herdr-superagent profile set calibrated=true`.
 
-Finally tell the person: "Calibration done. Hand me work with
-`herdr-superagent submit "…"` or by typing here; I route it and you review at
-checkpoints."
+Finally tell the person: "Calibration done. Hand me work by typing here; I
+route it and you review at checkpoints."
+
+**Calibration ends here.** Right after `calibrated=true` the daemon sends you
+a message that starts with `[superagent daemon]` and names the routing brief.
+Read that file and follow it from then on; nothing in this document applies
+any more. Until you have read it, do not act on any request: you would do
+the work yourself instead of routing it.
 
 ## Rules for every change, now and later
 

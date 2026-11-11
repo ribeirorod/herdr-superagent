@@ -198,6 +198,13 @@ pub fn add_worktree(repo: &str, branch: &str, path: &Path, base: &str) -> Result
     }
     let exists = git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_some();
     let mut args = vec!["-C".to_string(), repo.to_string(), "worktree".into(), "add".into()];
+    // On another machine the ticket's branch exists only on the remote: continue from there.
+    let pushed = format!("origin/{branch}");
+    let base = if !exists && git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{pushed}")]).is_some() {
+        pushed.as_str()
+    } else {
+        base
+    };
     if exists {
         args.extend([path.display().to_string(), branch.to_string()]);
     } else {
@@ -208,6 +215,30 @@ pub fn add_worktree(repo: &str, branch: &str, path: &Path, base: &str) -> Result
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Removes a ticket's worktree when it is one of the repository's and has nothing
+/// uncommitted; the branch stays. Returns why it was kept, if it was.
+pub fn remove_worktree(repo: &str, directory: &str) -> Option<String> {
+    let dir = std::path::Path::new(directory);
+    if directory.is_empty() || !dir.exists() || !std::path::Path::new(repo).join(".git").exists() {
+        return None;
+    }
+    // Only a linked worktree has a `.git` file; the person's own checkout has a directory and is never touched.
+    if !dir.join(".git").is_file() {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .args(["-C", repo, "worktree", "remove", directory])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => None,
+        Ok(out) => Some(format!(
+            "worktree {directory} kept: {}",
+            String::from_utf8_lossy(&out.stderr).trim().lines().next().unwrap_or("git refused")
+        )),
+        Err(e) => Some(format!("worktree {directory} kept: {e}")),
     }
 }
 

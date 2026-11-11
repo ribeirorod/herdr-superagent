@@ -55,6 +55,10 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
         }
     }
 
+    let skills = calibration::install_skill();
+    if !skills.is_empty() {
+        tracing::info!(harnesses = ?skills, "installed the superagent skill");
+    }
     let report = ensure(profile_name, true)?;
     let herdr = Herdr::from_env().map_err(|e| e.to_string())?;
     let panes = herdr.pane_list().map_err(|e| e.to_string())?;
@@ -96,12 +100,15 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
         });
     }
 
-    let args = calibration::model_args(&harness, &model);
+    let mut args = calibration::model_args(&harness, &model);
+    args.extend(profile.harness_flags.always(&harness, "session"));
     // The pane's shell may have a short PATH: export the login shell's before the harness starts.
     let exports = [
         format!("PATH={}", crate::envpath::full_path()),
         format!("SUPERAGENT_PROFILE={profile_name}"),
         "SUPERAGENT_ROLE=superagent".to_string(),
+        // A greyed-out suggested reply reads like a typed approval; approvals only count through `approve`.
+        "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false".to_string(),
     ];
     let _ = herdr.pane_run(&pane.pane_id, &format!("export {}; clear", crate::ensure::shell_words(&exports)));
     std::thread::sleep(Duration::from_millis(800));
@@ -183,8 +190,9 @@ fn prompt_when_ready(herdr: &Herdr, pane_id: &str, prompt: &str) -> Result<(), S
             Duration::from_millis(ms + 5000),
         );
     };
-    wait(90_000);
-    let mut deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // No blind wait: the prompt is tried at once and retried while the harness boots,
+    // so the brief lands the moment the session can take it.
+    let mut deadline = std::time::Instant::now() + Duration::from_secs(120);
     let mut notified = false;
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
@@ -199,7 +207,7 @@ fn prompt_when_ready(herdr: &Herdr, pane_id: &str, prompt: &str) -> Result<(), S
                         Some(&format!("Answer the prompt in pane {pane_id}; the brief follows.")),
                     );
                     wait(600_000);
-                    deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    deadline = std::time::Instant::now() + Duration::from_secs(60);
                     continue;
                 }
                 if !(last.contains("agent_not_ready") || last.contains("not an active") || last.contains("agent_blocked")) {
@@ -207,7 +215,7 @@ fn prompt_when_ready(herdr: &Herdr, pane_id: &str, prompt: &str) -> Result<(), S
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(1500));
+        std::thread::sleep(Duration::from_millis(1000));
     }
     Err(format!(
         "the superagent session did not become ready ({last}); paste this into pane {pane_id}: {prompt}"

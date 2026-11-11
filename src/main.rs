@@ -21,6 +21,8 @@ mod herdr;
 mod ipc;
 mod logging;
 mod memory;
+mod notify;
+mod packs;
 mod paths;
 mod profile;
 mod session;

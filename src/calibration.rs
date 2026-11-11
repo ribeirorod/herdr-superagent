@@ -219,7 +219,48 @@ pub fn brief(profile: &Profile, profile_dir: &Path) -> String {
 pub fn calibration(profile_name: &str) -> String {
     CALIBRATION_PROMPT
         .replace("`SUPERAGENT_PROFILE`", &format!("`{profile_name}`"))
+        .replace("{profile_name}", profile_name)
         .replace("{bin}", &crate::envpath::self_path())
+}
+
+pub const SKILL: &str = include_str!("../skills/superagent/SKILL.md");
+
+/// Where each harness reads personal skills from, when the harness is set up on this machine.
+pub fn skill_dirs() -> Vec<(String, std::path::PathBuf)> {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return Vec::new();
+    };
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+    let codex = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    [("claude", claude), ("codex", codex), ("pi", home.join(".pi").join("agent"))]
+        .into_iter()
+        .filter(|(_, dir)| dir.is_dir())
+        .map(|(name, dir)| (name.to_string(), dir.join("skills").join("superagent")))
+        .collect()
+}
+
+/// Installs the superagent skill for every harness set up here, without `npx`:
+/// workers must know `spawn` and `checkpoint` even where no node is on PATH.
+/// Returns the harnesses whose copy was written or refreshed.
+pub fn install_skill() -> Vec<String> {
+    let mut written = Vec::new();
+    for (harness, dir) in skill_dirs() {
+        let file = dir.join("SKILL.md");
+        if std::fs::read_to_string(&file).map(|t| t == SKILL).unwrap_or(false) {
+            continue;
+        }
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&file, SKILL)) {
+            Ok(()) => written.push(harness),
+            Err(e) => tracing::warn!(%harness, file = %file.display(), %e, "could not install the superagent skill"),
+        }
+    }
+    written
 }
 
 /// The model argument each harness takes.

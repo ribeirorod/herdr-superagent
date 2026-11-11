@@ -405,12 +405,15 @@ impl Engine {
                     mode: self.policy().mode_for(&request, mode.or(request.mode)),
                 };
                 let decision_id = key(&["decision", &eval.id, &self.now()]);
+                let workflow = workflow.or(request.workflow.clone());
+                let plan = self.policy().plan_for(&request, workflow.as_deref(), &title);
                 let new = NewTicket {
                     decision_id: decision_id.clone(),
                     title,
-                    workflow: workflow.or(request.workflow.clone()),
+                    workflow,
                     name,
                     note,
+                    plan,
                 };
                 let ticket = self.create_ticket(&request, mandate.clone(), new)?;
                 let decision = self.record_decision(

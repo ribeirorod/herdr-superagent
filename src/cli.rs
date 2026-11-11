@@ -81,6 +81,11 @@ pub enum Command {
     Candidates,
     /// Route a candidate: accept it into a ticket, attach it to one, stop one, or ignore it.
     Route(RouteArgs),
+    /// The workflows a request can be routed to, from the built-in and the profile's packs.
+    Packs {
+        /// Show one workflow's steps: `feature`, `software-dev/bugfix`, …
+        workflow: Option<String>,
+    },
     /// List tickets.
     Tickets {
         /// Include ended tickets.
@@ -141,6 +146,10 @@ pub enum Command {
         #[arg(long)]
         comment: Option<String>,
     },
+    /// Send the waiting checkpoint back to the worker with what must change.
+    RequestChanges { ticket: String, comment: String },
+    /// Rename a ticket (its workspace and record follow).
+    Retitle { ticket: String, title: String },
     /// Stop a ticket; it receives nothing more.
     StopTicket {
         ticket: String,
@@ -284,6 +293,9 @@ pub struct RouteArgs {
     pub workflow: Option<String>,
     #[arg(long)]
     pub mode: Option<String>,
+    /// The repository this ticket works in (a path); the worker gets its own worktree of it.
+    #[arg(long)]
+    pub project: Option<String>,
     #[arg(long, default_value = "")]
     pub reason: String,
     #[arg(long)]
@@ -585,7 +597,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             };
             let decision = daemon(
                 "decide",
-                json!({ "request_id": args.request_id, "eval_id": args.eval, "outcome": outcome }),
+                json!({ "request_id": args.request_id, "eval_id": args.eval, "outcome": outcome, "project": args.project }),
             )?;
             let text = format!(
                 "{} → {}{}",
@@ -594,6 +606,48 @@ pub fn run(cli: Cli) -> Result<i32, String> {
                 decision["ticket_id"].as_str().map(|t| format!(" ticket {t}")).unwrap_or_default()
             );
             out(decision, text)
+        }
+        Command::Packs { workflow } => {
+            let (packs, problems) = crate::packs::load(&paths.profile_dir());
+            for problem in &problems {
+                eprintln!("skipped an invalid pack: {problem}");
+            }
+            match workflow {
+                Some(name) => {
+                    let chosen =
+                        crate::packs::find(&packs, &name).ok_or_else(|| format!("no workflow '{name}'; run `herdr-superagent packs`"))?;
+                    let text = chosen.brief_section(&chosen.root_role());
+                    out(serde_json::to_value(&chosen).map_err(|e| e.to_string())?, text)
+                }
+                None => {
+                    let mut lines = Vec::new();
+                    for pack in &packs {
+                        lines.push(format!(
+                            "{} v{} ({}): {}",
+                            pack.meta.id, pack.meta.version, pack.origin, pack.meta.description
+                        ));
+                        for w in &pack.workflows {
+                            let checkpoints: Vec<&str> = w.steps.iter().filter_map(|s| s.checkpoint.as_deref()).collect();
+                            lines.push(format!(
+                                "  {:<12} {} [{} steps{}]",
+                                w.id,
+                                w.description,
+                                w.steps.len(),
+                                if checkpoints.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(", checkpoints: {}", checkpoints.join(", "))
+                                }
+                            ));
+                        }
+                    }
+                    lines.push(format!(
+                        "your own packs go in {}/packs/<id>/ (pack.toml, roles/*.md, workflows/*.toml)",
+                        paths.profile_dir().display()
+                    ));
+                    out(serde_json::to_value(&packs).map_err(|e| e.to_string())?, lines.join("\n"))
+                }
+            }
         }
         Command::Tickets { all } => {
             let list = daemon("tickets", json!({ "all": all }))?;
@@ -748,6 +802,14 @@ layout = [
             let value = daemon("approve", json!({ "ticket": ticket, "comment": comment }))?;
             out(value.clone(), ticket_line(&value))
         }
+        Command::RequestChanges { ticket, comment } => {
+            let value = daemon("request_changes", json!({ "ticket": ticket, "comment": comment }))?;
+            out(value.clone(), ticket_line(&value))
+        }
+        Command::Retitle { ticket, title } => {
+            let value = daemon("retitle", json!({ "ticket": ticket, "title": title }))?;
+            out(value.clone(), ticket_line(&value))
+        }
         Command::StopTicket { ticket, reason } => {
             let value = daemon("stop_ticket", json!({ "ticket": ticket, "reason": reason }))?;
             out(value.clone(), ticket_line(&value))
@@ -893,6 +955,7 @@ layout = [
                 .collect();
             let cutoff = crate::core::clock::plus_ms(&crate::core::clock::now_iso(), -(older_than_hours as i64) * 3_600_000);
             let mut closed = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
             for t in tickets.as_array().cloned().unwrap_or_default() {
                 let ended = t["ended"]["at"].as_str().unwrap_or("");
                 let Some(workspace) = t.pointer("/execution/workspace_id").and_then(Value::as_str) else {
@@ -901,13 +964,23 @@ layout = [
                 if ended.is_empty() || ended > cutoff.as_str() || !open.contains(workspace) {
                     continue;
                 }
-                herdr
-                    .call("workspace.close", json!({ "workspace_id": workspace }))
-                    .map_err(|e| e.to_string())?;
-                closed.push(format!("{} ({})", t["id"].as_str().unwrap_or(""), workspace));
+                // A workspace that is already gone, or one herdr refuses to close, must not stop the rest.
+                match herdr.call("workspace.close", json!({ "workspace_id": workspace })) {
+                    Ok(_) => closed.push(format!("{} ({})", t["id"].as_str().unwrap_or(""), workspace)),
+                    Err(e) => skipped.push(format!("{} ({workspace}): {e}", t["id"].as_str().unwrap_or(""))),
+                }
+                // The worktree goes too when it is clean; its branch stays.
+                if let (Some(repo), Some(dir)) = (t["project"].as_str(), t.pointer("/execution/directory").and_then(Value::as_str)) {
+                    if let Some(note) = crate::gitbase::remove_worktree(&crate::profile::expand_home(repo), dir) {
+                        skipped.push(format!("{}: {note}", t["id"].as_str().unwrap_or("")));
+                    }
+                }
+            }
+            for line in &skipped {
+                eprintln!("skipped {line}");
             }
             out(
-                json!({ "closed": closed }),
+                json!({ "closed": closed, "skipped": skipped }),
                 if closed.is_empty() {
                     "nothing to tidy".to_string()
                 } else {
@@ -931,16 +1004,19 @@ layout = [
             let mut cleared = Vec::new();
             for pane in herdr.pane_list().map_err(|e| e.to_string())? {
                 if let Some(tokens) = mine(&pane.tokens) {
-                    herdr.clear_pane_metadata(&pane.pane_id, &tokens).map_err(|e| e.to_string())?;
-                    cleared.push(pane.pane_id);
+                    // A pane that closed since the listing has nothing left to clear.
+                    match herdr.clear_pane_metadata(&pane.pane_id, &tokens) {
+                        Ok(()) => cleared.push(pane.pane_id),
+                        Err(e) => tracing::debug!(pane = %pane.pane_id, %e, "cleanup skipped a pane"),
+                    }
                 }
             }
             for workspace in herdr.workspace_list().map_err(|e| e.to_string())? {
                 if let Some(tokens) = mine(&workspace.tokens) {
-                    herdr
-                        .clear_workspace_metadata(&workspace.workspace_id, &tokens)
-                        .map_err(|e| e.to_string())?;
-                    cleared.push(workspace.workspace_id);
+                    match herdr.clear_workspace_metadata(&workspace.workspace_id, &tokens) {
+                        Ok(()) => cleared.push(workspace.workspace_id),
+                        Err(e) => tracing::debug!(workspace = %workspace.workspace_id, %e, "cleanup skipped a workspace"),
+                    }
                 }
             }
             out(
@@ -1264,6 +1340,28 @@ fn ticket_detail(ticket: &Value) -> String {
                 .lines()
                 .next()
                 .unwrap_or("")
+        ));
+    }
+    if let Some(pack) = ticket["pack"].as_str() {
+        let required: Vec<&str> = ticket["required_checkpoints"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let approved: Vec<&str> = ticket["approved_checkpoints"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let marks: Vec<String> = required
+            .iter()
+            .map(|name| format!("{}{name}", if approved.contains(name) { "✓ " } else { "· " }))
+            .collect();
+        lines.push(format!(
+            "pack: {pack}{}",
+            if marks.is_empty() {
+                String::new()
+            } else {
+                format!("   checkpoints: {}", marks.join("  "))
+            }
         ));
     }
     if let Some(c) = ticket.get("checkpoint").filter(|c| !c.is_null()) {

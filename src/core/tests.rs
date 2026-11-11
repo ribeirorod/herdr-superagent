@@ -1296,21 +1296,27 @@ fn a_checkpoint_waits_for_review_and_an_approval_resumes_the_worker() {
         ticket.running_assignment().unwrap().report.as_ref().unwrap().state,
         ReportState::Waiting
     );
-    assert_eq!(
-        h.engine.checkpoint(&ticket_id, "again", "x").unwrap_err().code,
-        ErrorCode::CheckpointOpen
-    );
     // Interrupted at a checkpoint, the worker keeps its session.
     let running = h.running(&ticket_id).id;
     h.engine.assignment_interrupted(&ticket_id, &running).unwrap();
     assert_eq!(h.ticket(&ticket_id).assignments.len(), 1);
+    // The scope changed while it waited: the worker posts the plan again and the summary follows.
+    let revised = h.engine.checkpoint(&ticket_id, "plan", "Plan: one repo only").unwrap();
+    assert_eq!(revised.checkpoint.as_ref().unwrap().summary, "Plan: one repo only");
+    // Sent back, it is not approved and the worker hears why.
+    let back = h.engine.request_changes(&ticket_id, "drop step 3").unwrap();
+    assert!(back.checkpoint.is_none() && back.approved_checkpoints.is_empty());
+    assert_eq!(h.engine.request_changes(&ticket_id, "x").unwrap_err().code, ErrorCode::NoCheckpoint);
+    h.engine.checkpoint(&ticket_id, "plan", "Plan: two steps").unwrap();
+    // A guard checkpoint holds a risky action back and is not replaced by another name.
+    assert_eq!(h.engine.retitle(&ticket_id, "  Fix   login only ").unwrap().title, "Fix login only");
     let approved = h.engine.approve(&ticket_id, Some("looks good".into())).unwrap();
     assert!(approved.checkpoint.is_none());
     assert_eq!(ticket_stage(&approved), TicketStage::Idle, "idle until the worker reports progress");
     assert!(
         matches!(approved.inputs.last().unwrap(), TicketInput::Text { text, .. } if text.contains("'plan' approved") && text.contains("looks good"))
     );
-    assert_eq!(h.settle().len(), 1);
+    assert_eq!(h.settle().len(), 2, "the change request and the approval");
     assert!(h.event_types().iter().any(|t| t == "checkpoint_reached"));
     assert!(h.event_types().iter().any(|t| t == "checkpoint_approved"));
     h.engine.stop_ticket(&ticket_id, None).unwrap();

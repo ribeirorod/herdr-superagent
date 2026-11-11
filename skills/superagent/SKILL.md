@@ -43,6 +43,18 @@ Roles: `reviewer` (reads, does not change files), `builder` (implements a
 bounded piece), `researcher`. Give the child a complete task in `--task`;
 it does not see your conversation.
 
+Never use your harness's own subagents (Claude's Task or Agent tool) to
+split work: they are invisible to herdr and the person. `spawn` is the only
+way to delegate.
+
+## Checkpoints can be revised
+
+If the scope changes while you wait at a checkpoint, redo the plan and run the
+same `checkpoint <name> --summary "…"` again; the new summary replaces the
+old one. `herdr-superagent retitle <ticket> "…"` renames a ticket whose title
+no longer fits. Approval only arrives as a message that starts with
+"Checkpoint '…' approved".
+
 ## Rules
 
 - Never approve your own checkpoints; a person does.

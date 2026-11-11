@@ -1,0 +1,9 @@
+id = "bugfix"
+description = "Reproduce, fix, review, deliver the branch."
+match = { keywords = ["bug", "fix", "broken", "crash", "error", "regression", "fails", "failing", "flaky", "exception", "wrong"] }
+steps = [
+  { role = "worker", goal = "Reproduce the bug and name its cause", checkpoint = "plan" },
+  { role = "worker", goal = "Fix it with a test that fails before and passes after" },
+  { role = "reviewer", goal = "Review the fix and the test", spawn = true },
+  { role = "worker", goal = "Apply the review, run the full checks, push the branch", risk = ["remote-write"] },
+]

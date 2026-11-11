@@ -50,7 +50,7 @@ impl ErrorCode {
             ErrorCode::QuestionWithResult => (false, "A question for a person cannot come with a ready result; report it separately"),
             ErrorCode::NoCheckpoint => (false, "Ticket has no checkpoint waiting for review"),
             ErrorCode::CheckpointOpen => (false, "Ticket already waits at checkpoint {checkpoint}; approve it first"),
-            ErrorCode::CheckpointRequired => (false, "This ticket runs in {mode} mode: a ready report needs an approved checkpoint first (start with `checkpoint plan`)"),
+            ErrorCode::CheckpointRequired => (false, "This ticket runs in {mode} mode: a ready report needs an approved checkpoint first (start with `checkpoint plan`){checkpoints}"),
             ErrorCode::AcceptedBefore => (false, "Request {request} already started ticket {ticket}"),
             ErrorCode::Paused => (false, "Processing is paused"),
             ErrorCode::Internal => (false, "{text}"),
@@ -86,9 +86,15 @@ impl UserError {
     pub fn message(&self) -> String {
         let mut text = self.code.describe().1.to_string();
         for (name, value) in &self.values {
-            text = text.replace(&format!("{{{name}}}"), value);
+            // The workflow's own checkpoints, when some are still missing.
+            let value = if name == "checkpoints" {
+                format!("; still to be approved: {value}")
+            } else {
+                value.clone()
+            };
+            text = text.replace(&format!("{{{name}}}"), &value);
         }
-        text
+        text.replace("{checkpoints}", "")
     }
     pub fn code_name(&self) -> String {
         serde_json::to_value(self.code)

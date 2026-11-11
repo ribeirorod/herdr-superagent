@@ -156,7 +156,7 @@ pub fn run(profile_name: &str) -> Result<(), String> {
             Err(e) => tracing::warn!(%e, "reindex failed"),
         }
     }
-    let policy = Rc::new(ProfilePolicy::new(profile));
+    let policy = Rc::new(ProfilePolicy::new(profile, &paths.profile_dir()));
     let executor = Rc::new(EffectsExecutor { store: store.clone() });
     let events: Rc<RefCell<Vec<DomainEvent>>> = Rc::new(RefCell::new(Vec::new()));
     let sink = events.clone();
@@ -414,8 +414,10 @@ impl Daemon {
         if let Err(e) = self.engine.evaluate_due() {
             tracing::warn!(%e, "evaluate_due failed");
         }
+        self.route_unrouted();
         self.drain_effects();
         self.observe_workers();
+        self.announce();
         self.auto_tidy();
         self.watch_profile();
         self.flush_records();
@@ -441,7 +443,14 @@ impl Daemon {
                 continue;
             }
             match herdr.call("workspace.close", json!({ "workspace_id": workspace })) {
-                Ok(_) => tracing::info!(ticket = %ticket.id, workspace, "closed the ended ticket's workspace"),
+                Ok(_) => {
+                    tracing::info!(ticket = %ticket.id, workspace, "closed the ended ticket's workspace");
+                    if let Some(repo) = ticket.project.as_deref() {
+                        if let Some(note) = crate::gitbase::remove_worktree(&crate::profile::expand_home(repo), &execution.directory) {
+                            tracing::info!(ticket = %ticket.id, %note, "worktree kept");
+                        }
+                    }
+                }
                 Err(e) => tracing::debug!(ticket = %ticket.id, %e, "tidy skipped"),
             }
         }
@@ -482,6 +491,9 @@ impl Daemon {
         self.policy.replace(after.clone());
         self.engine.policy_changed(&from, &to, &effects)?;
         tracing::info!(%from, %to, tickets = effects.len(), "profile reloaded");
+        if !before.calibrated && after.calibrated {
+            self.switch_to_routing();
+        }
         if self.state_repo.borrow().is_none() {
             if let Ok(repo) = StateRepo::open_or_init(&after, &self.paths.profile_dir()) {
                 *self.state_repo.borrow_mut() = repo;
@@ -503,7 +515,11 @@ impl Daemon {
                 | DomainEvent::AssignmentStarted { ticket_id, .. }
                 | DomainEvent::AssignmentEnded { ticket_id, .. }
                 | DomainEvent::CheckpointReached { ticket_id, .. }
-                | DomainEvent::CheckpointApproved { ticket_id, .. } => Some(ticket_id.clone()),
+                | DomainEvent::CheckpointApproved { ticket_id, .. }
+                | DomainEvent::ChangesRequested { ticket_id, .. }
+                | DomainEvent::Reported { ticket_id, .. }
+                | DomainEvent::InputAdded { ticket_id, .. }
+                | DomainEvent::Retitled { ticket_id, .. } => Some(ticket_id.clone()),
                 _ => None,
             };
             if let Some(id) = ticket_id {
@@ -693,6 +709,12 @@ impl Daemon {
             "stop_ticket" => Ok(ticket_view(
                 &self.engine.stop_ticket(str_param(params, "ticket")?, opt_param(params, "reason"))?,
             )),
+            "request_changes" => Ok(ticket_view(
+                &self
+                    .engine
+                    .request_changes(str_param(params, "ticket")?, str_param(params, "comment")?)?,
+            )),
+            "retitle" => self.retitle(str_param(params, "ticket")?, str_param(params, "title")?),
             "retry" => Ok(ticket_view(&self.engine.retry_ticket(str_param(params, "ticket")?)?)),
             "note" => Ok(ticket_view(
                 &self.engine.note(str_param(params, "ticket")?, str_param(params, "text")?)?,
@@ -764,6 +786,22 @@ impl Daemon {
             },
             other => Err(UserError::internal(format!("unknown method '{other}'"))),
         }
+    }
+
+    /// Renames a ticket, its workspace and its record.
+    fn retitle(&self, ticket_id: &str, title: &str) -> Handler {
+        let mut ticket = self.engine.retitle(ticket_id, title)?;
+        let label = crate::executor::workspace_label(&ticket.title, &ticket.id);
+        if let Some(execution) = ticket.execution.as_mut() {
+            execution.name = label.clone();
+            if let (Some(herdr), Some(workspace)) = (&self.herdr, &execution.workspace_id) {
+                if let Err(e) = herdr.call("workspace.rename", json!({ "workspace_id": workspace, "label": label })) {
+                    tracing::debug!(%e, "workspace.rename not available; the label keeps the old title");
+                }
+            }
+            self.store.ticket_save(&ticket);
+        }
+        Ok(ticket_view(&ticket))
     }
 
     fn engine_ticket(&self, id: &str) -> Result<Ticket, UserError> {
@@ -883,6 +921,7 @@ impl Daemon {
             meta: params.get("meta").cloned().unwrap_or(Value::Null),
         };
         let received = self.engine.receive(request.clone())?;
+        self.settle_project(&id, None, "");
         let mut result = json!({ "request_id": id, "received": format!("{received:?}").to_lowercase() });
         // A request that names its workflow skips routing (PLAN §8).
         if let Some(workflow) = workflow {
@@ -901,11 +940,109 @@ impl Daemon {
             let decision = self.engine.decide(&id, DecisionInput { eval_id: None, outcome })?;
             result["ticket_id"] = json!(decision.ticket_id);
             result["decision_id"] = json!(decision.id);
+        } else if self.policy.snapshot().routing.routing == "never" {
+            // Routing is off: the deterministic scorer picks the workflow at once.
+            if let Some(decision) = self.accept_by_scorer(&id, "routingOff")? {
+                result["ticket_id"] = json!(decision.ticket_id);
+                result["decision_id"] = json!(decision.id);
+            }
         } else if let Some(eval) = self.store.eval_by_request(&id) {
             result["eval_id"] = json!(eval.id);
         }
         self.register(true);
         Ok(result)
+    }
+
+    /// A ticket that targets a repository must be created with it, or its worker
+    /// gets no worktree and reads the person's checkout directly. The project is the
+    /// one routing named, else the one the request already has, else the profile
+    /// repository the request names.
+    fn settle_project(&self, request_id: &str, named: Option<String>, title: &str) {
+        let Some(mut request) = self.store.request_get(request_id) else {
+            return;
+        };
+        let project = named
+            .map(|p| crate::profile::expand_home(&p))
+            .or_else(|| request.project.clone())
+            .or_else(|| infer_project(&self.policy.snapshot(), &format!("{title}\n{}", request.text)));
+        if project.is_some() && project != request.project {
+            tracing::info!(request = %request_id, project = ?project, "request settled on a project");
+            request.project = project;
+            self.store.request_save(&request);
+        }
+    }
+
+    /// Accepts a person's own request with the workflow the keyword scorer picks
+    /// (PLAN §8): the path when routing is off or the session never answered.
+    fn accept_by_scorer(&self, request_id: &str, why: &str) -> Result<Option<Decision>, UserError> {
+        let Some(request) = self.store.request_get(request_id) else {
+            return Ok(None);
+        };
+        let Some(eval) = self.store.eval_by_request(request_id) else {
+            return Ok(None);
+        };
+        if eval.strength != Strength::Explicit {
+            // Outside text (an issue, a mail) is data: it never becomes work without a judgement.
+            return Ok(None);
+        }
+        let title: String = request.text.lines().next().unwrap_or("").chars().take(72).collect();
+        let outcome = Outcome::Accept {
+            title,
+            scope: "scored".into(),
+            reason: Reason::code(why),
+            rules: Vec::new(),
+            workflow: None,
+            mode: request.mode,
+            name: None,
+            note: None,
+            audit: None,
+        };
+        let decision = self.engine.decide(request_id, DecisionInput { eval_id: None, outcome })?;
+        tracing::info!(request = %request_id, ticket = ?decision.ticket_id, why, "accepted by the scorer");
+        Ok(Some(decision))
+    }
+
+    /// Requests the session did not route in time were recorded `unavailable`: the scorer takes over.
+    fn route_unrouted(&self) {
+        let unavailable: Vec<String> = self
+            .events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                DomainEvent::DecisionRecorded {
+                    kind: DecisionKind::Unavailable,
+                    request_id,
+                    ..
+                } => Some(request_id.clone()),
+                _ => None,
+            })
+            .collect();
+        // Nobody to route (no superagent session was ever started here): do not let requests wait forever.
+        if self.store.kv_get("session.pane_id").filter(|p| !p.is_empty()).is_none() {
+            let now = clock::now_iso();
+            for eval in self.store.eval_list() {
+                if eval.paused_at.is_none() && clock::millis_between(&eval.started_at, &now) >= 20_000 {
+                    if let Err(e) = self.accept_by_scorer(&eval.request_id, "noSession") {
+                        tracing::warn!(request = %eval.request_id, %e, "scorer routing failed");
+                    }
+                }
+            }
+        }
+        for request_id in unavailable {
+            if self.store.kv_get(&format!("fallback.{request_id}")).is_some() {
+                continue;
+            }
+            self.store.kv_set(&format!("fallback.{request_id}"), &clock::now_iso());
+            match self.engine.reevaluate(&request_id) {
+                Ok(true) => {
+                    if let Err(e) = self.accept_by_scorer(&request_id, "routerUnavailable") {
+                        tracing::warn!(request = %request_id, %e, "fallback routing failed");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(request = %request_id, %e, "could not requeue an unrouted request"),
+            }
+        }
     }
 
     fn candidates(&self) -> Handler {
@@ -939,10 +1076,39 @@ impl Daemon {
         if let Some(eval) = self.store.eval_by_request(request_id) {
             self.engine.candidate_delivered(&eval.id)?;
         }
+        if let Outcome::Accept { title, .. } = &outcome {
+            self.settle_project(request_id, opt_param(params, "project"), title);
+        }
         let decision = self.engine.decide(request_id, DecisionInput { eval_id, outcome })?;
         self.register(true);
         Ok(serde_json::to_value(decision)?)
     }
+}
+
+/// The one profile repository a text names: by its path, or by its directory
+/// name as a whole word. Two candidates mean no answer.
+pub fn infer_project(profile: &Profile, text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    for repo in &profile.repos {
+        let path = crate::profile::expand_home(&repo.path);
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let hit = lower.contains(&path.to_lowercase())
+            || lower.contains(&repo.path.to_lowercase())
+            || (name.len() >= 3 && words.iter().any(|w| w.trim_matches('.') == name));
+        if hit && !found.contains(&path) {
+            found.push(path);
+        }
+    }
+    (found.len() == 1).then(|| found.remove(0))
 }
 
 fn str_param<'a>(params: &'a Value, name: &str) -> Result<&'a str, UserError> {

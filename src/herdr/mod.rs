@@ -27,7 +27,10 @@ pub enum HerdrError {
 impl std::fmt::Display for HerdrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HerdrError::NotInsideHerdr => write!(f, "not inside herdr: HERDR_SOCKET_PATH is not set"),
+            HerdrError::NotInsideHerdr => write!(
+                f,
+                "herdr not found: HERDR_SOCKET_PATH is not set and no herdr socket answers in its usual directories"
+            ),
             HerdrError::Io(e) => write!(f, "herdr socket: {e}"),
             HerdrError::Protocol(e) => write!(f, "herdr protocol: {e}"),
             HerdrError::Api { code, message } => write!(f, "herdr: {code}: {message}"),
@@ -80,12 +83,17 @@ pub struct Herdr {
 }
 
 impl Herdr {
+    /// The socket of the running herdr: `HERDR_SOCKET_PATH` inside a pane, else
+    /// the first socket found where herdr keeps it, so the CLI also works from
+    /// a shell herdr did not start.
     pub fn from_env() -> Result<Herdr, HerdrError> {
         let socket = std::env::var_os("HERDR_SOCKET_PATH")
             .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| discover_socket(&socket_candidates()))
             .ok_or(HerdrError::NotInsideHerdr)?;
         Ok(Herdr {
-            socket: PathBuf::from(socket),
+            socket,
             timeout: Duration::from_secs(10),
         })
     }
@@ -277,6 +285,49 @@ impl Herdr {
     }
 }
 
+/// Where herdr may keep its socket when the environment does not say: its
+/// config and runtime directories, by the platform's own conventions.
+pub fn socket_candidates() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(dir) = var("HERDR_CONFIG_DIR") {
+        dirs.push(dir);
+    }
+    if let Some(dir) = var("XDG_CONFIG_HOME") {
+        dirs.push(dir.join("herdr"));
+    }
+    if let Some(dir) = var("XDG_RUNTIME_DIR") {
+        dirs.push(dir.join("herdr"));
+    }
+    if let Some(home) = var("HOME") {
+        dirs.push(home.join(".config").join("herdr"));
+        dirs.push(home.join("Library").join("Application Support").join("herdr"));
+        dirs.push(home.join(".local").join("state").join("herdr"));
+        dirs.push(home.join(".herdr"));
+    }
+    dirs.into_iter().map(|d| d.join("herdr.sock")).collect()
+}
+
+/// The first candidate that is a socket something listens on.
+pub fn discover_socket(candidates: &[PathBuf]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        candidates
+            .iter()
+            .find(|path| {
+                std::fs::metadata(path).map(|m| m.file_type().is_socket()).unwrap_or(false)
+                    && std::os::unix::net::UnixStream::connect(path).is_ok()
+            })
+            .cloned()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = candidates;
+        None
+    }
+}
+
 fn truncate(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((i, _)) => format!("{}… ({} bytes)", &text[..i], text.len()),
@@ -296,6 +347,17 @@ pub fn seq_now() -> u64 {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn discovers_a_listening_socket_and_skips_dead_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = dir.path().join("dead.sock");
+        std::fs::write(&dead, "").unwrap();
+        let live = dir.path().join("herdr.sock");
+        let _listener = UnixListener::bind(&live).unwrap();
+        assert_eq!(discover_socket(&[dead.clone(), live.clone()]), Some(live));
+        assert_eq!(discover_socket(&[dead]), None);
+    }
 
     #[test]
     fn sends_one_request_per_connection_and_parses_errors() {

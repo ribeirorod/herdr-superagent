@@ -1,0 +1,7 @@
+id = "research"
+description = "Find out and report; nothing is changed."
+match = { keywords = ["research", "investigate", "find out", "compare", "survey", "triage", "audit", "analyse", "analyze", "summarise", "summarize", "what is", "why does", "how does", "list all"] }
+steps = [
+  { role = "researcher", goal = "Scope the question: what to look at and where", checkpoint = "plan" },
+  { role = "researcher", goal = "Collect the evidence and write the report with sources" },
+]

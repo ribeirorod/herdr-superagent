@@ -34,8 +34,72 @@ pub fn branch_rules(ticket: &Ticket) -> String {
     }
 }
 
-pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, assignment: &Assignment, hits: &[MemoryHit]) -> String {
+/// What the daemon knows beyond the ticket: the workflow pack and the profile's repositories.
+#[derive(Debug, Clone, Default)]
+pub struct Extra {
+    /// The workflow's steps, as `packs::Chosen::brief_section` renders them (root assignments only).
+    pub workflow_steps: String,
+    /// The pack's prompt for this role.
+    pub role_prompt: String,
+    /// The profile's repositories: `(path, default branch, notes)`.
+    pub repos: Vec<(String, String, String)>,
+}
+
+/// Where uncommitted work may sit: the person's own checkout of the ticket's repository.
+fn checkout_rule(ticket: &Ticket) -> String {
+    let worktree = ticket.execution.as_ref().map(|e| e.directory.as_str()).unwrap_or("");
+    match ticket.project.as_deref() {
+        Some(project) if !project.is_empty() && project != worktree => format!(
+            "the person's own checkout is `{project}`. Read it, never write to it: `git -C {project} status -sb`, `git -C {project} diff`, `git -C {project} stash list`. Changes there are not on any branch yet and may be exactly what the request is about."
+        ),
+        _ => "this ticket has no repository of its own; see the repositories below.".to_string(),
+    }
+}
+
+fn repos_section(ticket: &Ticket, repos: &[(String, String, String)]) -> String {
+    if repos.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = repos
+        .iter()
+        .map(|(path, branch, notes)| {
+            let mut line = format!("- `{path}`");
+            if !branch.is_empty() {
+                line.push_str(&format!(" (default branch `{branch}`)"));
+            }
+            if !notes.is_empty() {
+                line.push_str(&format!(": {notes}"));
+            }
+            line
+        })
+        .collect();
+    let rule = if ticket.execution.as_ref().and_then(|e| e.branch.as_ref()).is_some() {
+        "Your worktree is the only place you change files. Every path below is the person's own checkout: read-only for you."
+    } else {
+        "This ticket has no worktree. Every path below is the person's own checkout: **read-only for you**. Never commit, switch branches, stash or edit there. If the work needs changes in one of them, say so with `report --state blocked --question \"…\"` so a ticket for that repository can be opened; for a scratch copy use `git -C <path> worktree add <dir> <ref>` under your own directory."
+    };
+    format!("## The profile's repositories\n\n{rule}\n\n{}\n\n", lines.join("\n"))
+}
+
+pub fn render(
+    profile: &str,
+    ticket: &Ticket,
+    request: Option<&Request>,
+    assignment: &Assignment,
+    hits: &[MemoryHit],
+    extra: &Extra,
+) -> String {
     let role = assignment.role.as_str();
+    let role_prompt = if extra.role_prompt.trim().is_empty() {
+        String::new()
+    } else {
+        format!("## Your role: {role}\n\n{}\n\n", extra.role_prompt.trim())
+    };
+    let workflow_steps = if assignment.is_root() && !extra.workflow_steps.is_empty() {
+        format!("{}\n", extra.workflow_steps)
+    } else {
+        String::new()
+    };
     let mode = assignment.mode.unwrap_or(ticket.mandate.mode);
     let task = match &assignment.task {
         Some(task) => format!(
@@ -85,6 +149,10 @@ pub fn render(profile: &str, ticket: &Ticket, request: Option<&Request>, assignm
         .replace("{title}", &ticket.title)
         .replace("{mode}", mode.as_str())
         .replace("{task}", &task)
+        .replace("{role_prompt}", &role_prompt)
+        .replace("{workflow_steps}", &workflow_steps)
+        .replace("{checkout}", &checkout_rule(ticket))
+        .replace("{repos}", &repos_section(ticket, &extra.repos))
         .replace("{assignment}", &assignment.id)
         .replace("{workflow}", ticket.workflow.as_deref().unwrap_or("general"))
         .replace("{project}", ticket.project.as_deref().unwrap_or("none (no repository)"))
@@ -168,6 +236,8 @@ pub(crate) mod tests {
             attention: None,
             checkpoint: None,
             approved_checkpoints: Vec::new(),
+            pack: None,
+            required_checkpoints: Vec::new(),
             assignments: vec![],
             inputs: vec![TicketInput::Note {
                 id: "n1".into(),
@@ -209,7 +279,22 @@ pub(crate) mod tests {
             task: None,
             mode: None,
         };
-        let text = render("work", &ticket(Mode::Propose), None, &worker, &hits);
+        let text = render(
+            "work",
+            &ticket(Mode::Propose),
+            None,
+            &worker,
+            &hits,
+            &Extra {
+                workflow_steps: "## Workflow: feature\n\n1. plan".into(),
+                role_prompt: "You own the ticket.".into(),
+                repos: vec![("/src/api".into(), "main".into(), "the API".into())],
+            },
+        );
+        assert!(text.contains("## Workflow: feature") && text.contains("## Your role: worker"));
+        assert!(text.contains("`/src/api` (default branch `main`): the API") && text.contains("read-only for you"));
+        assert!(text.contains("Never split work with your harness's own subagents"));
+        assert!(text.contains("the person's own checkout is `acme/api`"));
         assert!(text.contains("# Worker brief · ticket t-abc123 · worker"));
         assert!(text.contains("Propose mode: plan only"));
         assert!(text.contains("note from the superagent: tests live in tests/login"));
@@ -223,7 +308,7 @@ pub(crate) mod tests {
             mode: Some(Mode::Autonomous),
             ..worker.clone()
         };
-        let text = render("work", &ticket(Mode::Checkpoint), None, &child, &[]);
+        let text = render("work", &ticket(Mode::Checkpoint), None, &child, &[], &Extra::default());
         assert!(text.contains("Your task from the parent") && text.contains("Review the diff") && text.contains("Autonomous mode"));
         let (delivery, ids) = delivery_text(&ticket(Mode::Checkpoint), &|_| None, Some(std::path::Path::new("/b/brief.md")));
         assert!(delivery.starts_with("Read /b/brief.md and start on ticket t-abc123."));

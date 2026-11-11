@@ -20,6 +20,7 @@ pub struct NewTicket {
     pub workflow: Option<String>,
     pub name: Option<String>,
     pub note: Option<String>,
+    pub plan: WorkPlan,
 }
 
 impl Engine {
@@ -31,6 +32,7 @@ impl Engine {
             workflow,
             name,
             note,
+            plan,
         } = new;
         let mut id = short("t", &[&request.id, &decision_id]);
         if self.repo().ticket_get(&id).is_some() {
@@ -42,7 +44,9 @@ impl Engine {
             decision_id,
             mandate,
             project: request.project.clone(),
-            workflow,
+            workflow: plan.workflow.clone().or(workflow),
+            pack: plan.pack.clone(),
+            required_checkpoints: plan.required_checkpoints.clone(),
             ended: None,
             attention: None,
             checkpoint: None,
@@ -75,7 +79,12 @@ impl Engine {
             ticket.undelivered.push(input.id().to_string());
             ticket.inputs.push(input);
         }
-        let assignment = self.new_assignment(&mut ticket, "worker", None);
+        let role = if plan.root_role.is_empty() {
+            "worker"
+        } else {
+            plan.root_role.as_str()
+        };
+        let assignment = self.new_assignment(&mut ticket, role, None);
         self.repo().ticket_save(&ticket);
         self.executor().start(&ticket, &assignment);
         Ok(ticket)
@@ -211,7 +220,11 @@ impl Engine {
         let at = self.now();
         ticket.ended = None;
         ticket.updated_at = at.clone();
-        let assignment = self.new_assignment(&mut ticket, "worker", None);
+        let role = ticket
+            .latest_assignment()
+            .map(|a| a.role.clone())
+            .unwrap_or_else(|| "worker".into());
+        let assignment = self.new_assignment(&mut ticket, &role, None);
         let resumed = TicketInput::Resumed {
             id: key(&["input", ticket_id, "resumed", &request_id]),
             request_id: request_id.clone(),
@@ -389,6 +402,57 @@ impl Engine {
             at,
         };
         self.add_input(&mut ticket, input);
+        self.emit(DomainEvent::InputAdded {
+            ticket_id: ticket_id.to_string(),
+            kind: "note".into(),
+            text: text.to_string(),
+        });
+        self.require_ticket(ticket_id)
+    }
+
+    /// A ticket's title follows its scope: a person or the superagent renames it.
+    pub(crate) fn retitle_inner(&self, ticket_id: &str, title: &str) -> Result<Ticket, UserError> {
+        let mut ticket = self.require_ticket(ticket_id)?;
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() || title == ticket.title {
+            return Ok(ticket);
+        }
+        let from = std::mem::replace(&mut ticket.title, title.clone());
+        ticket.updated_at = self.now();
+        self.repo().ticket_save(&ticket);
+        self.emit(DomainEvent::Retitled {
+            ticket_id: ticket_id.to_string(),
+            from,
+            to: title,
+        });
+        Ok(ticket)
+    }
+
+    /// A person sends the waiting checkpoint back: it is not approved, and the worker is told why.
+    pub(crate) fn request_changes_inner(&self, ticket_id: &str, comment: &str) -> Result<Ticket, UserError> {
+        let mut ticket = self.require_ticket(ticket_id)?;
+        if !ticket.live() {
+            return Err(UserError::new(ErrorCode::TicketEnded));
+        }
+        let Some(checkpoint) = ticket.checkpoint.take() else {
+            return Err(UserError::new(ErrorCode::NoCheckpoint));
+        };
+        let at = self.now();
+        let input = TicketInput::Text {
+            id: key(&["input", ticket_id, "changes", &checkpoint.id, &at]),
+            text: format!(
+                "Checkpoint '{}' was NOT approved. Changes requested:\n{}\n\nRevise, then post the checkpoint again with a summary that matches the new plan, and end your turn.",
+                checkpoint.name,
+                comment.trim()
+            ),
+            at,
+        };
+        self.add_input(&mut ticket, input);
+        self.emit(DomainEvent::ChangesRequested {
+            ticket_id: ticket_id.to_string(),
+            name: checkpoint.name,
+            comment: comment.trim().to_string(),
+        });
         self.require_ticket(ticket_id)
     }
 
@@ -420,9 +484,16 @@ impl Engine {
         if !ticket.live() {
             return Err(UserError::new(ErrorCode::TicketEnded));
         }
-        if let Some(open) = &ticket.checkpoint {
-            return Err(UserError::new(ErrorCode::CheckpointOpen).with("checkpoint", &open.name));
-        }
+        // A worker may revise the checkpoint it waits at (the scope changed, the plan was
+        // redone): the new summary replaces the old one, so a person approves what is current.
+        // A guard checkpoint holds back a risky action and is never replaced.
+        let revised = match &ticket.checkpoint {
+            Some(open) if open.name.starts_with("guard-") && open.name != name => {
+                return Err(UserError::new(ErrorCode::CheckpointOpen).with("checkpoint", &open.name));
+            }
+            Some(_) => true,
+            None => false,
+        };
         let at = self.now();
         let assignment = match assignment_id {
             Some(id) => ticket
@@ -453,6 +524,8 @@ impl Engine {
         self.emit(DomainEvent::CheckpointReached {
             ticket_id: ticket_id.to_string(),
             name: name.to_string(),
+            summary: summary.to_string(),
+            revised,
         });
         Ok(ticket)
     }
@@ -468,9 +541,10 @@ impl Engine {
         ticket.approved_checkpoints.push(checkpoint.name.clone());
         let at = self.now();
         let mut text = format!("Checkpoint '{}' approved. Continue with the next step.", checkpoint.name);
-        if let Some(comment) = comment.filter(|c| !c.trim().is_empty()) {
+        let comment = comment.filter(|c| !c.trim().is_empty());
+        if let Some(comment) = &comment {
             text.push_str("\nReviewer's comment: ");
-            text.push_str(&comment);
+            text.push_str(comment);
         }
         let input = TicketInput::Text {
             id: key(&["input", ticket_id, "approve", &checkpoint.id]),
@@ -481,6 +555,7 @@ impl Engine {
         self.emit(DomainEvent::CheckpointApproved {
             ticket_id: ticket_id.to_string(),
             name: checkpoint.name,
+            comment,
         });
         self.require_ticket(ticket_id)
     }
@@ -517,6 +592,11 @@ impl Engine {
         ticket.updated_at = self.now();
         self.repo().ticket_save(&ticket);
         self.executor().start(&ticket, &child);
+        self.emit(DomainEvent::InputAdded {
+            ticket_id: ticket_id.to_string(),
+            kind: format!("spawn {role}"),
+            text: task.to_string(),
+        });
         Ok(child)
     }
 

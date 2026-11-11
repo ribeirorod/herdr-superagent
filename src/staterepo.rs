@@ -304,6 +304,15 @@ impl StateRepo {
             .collect::<Vec<_>>()
             .join("-");
         let id = ticket.id.trim_start_matches("t-");
+        // A renamed ticket keeps the directory it already has.
+        let suffix = format!("-{id}");
+        if let Ok(entries) = std::fs::read_dir(self.dir.join("tickets")) {
+            for entry in entries.filter_map(Result::ok) {
+                if entry.file_name().to_string_lossy().ends_with(&suffix) {
+                    return entry.path();
+                }
+            }
+        }
         self.dir.join("tickets").join(format!("{date}-{slug}-{id}"))
     }
 
@@ -527,6 +536,8 @@ mod tests {
             attention: None,
             checkpoint: None,
             approved_checkpoints: Vec::new(),
+            pack: None,
+            required_checkpoints: Vec::new(),
             assignments: vec![],
             inputs: vec![],
             undelivered: vec![],

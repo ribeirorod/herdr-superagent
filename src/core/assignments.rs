@@ -149,12 +149,20 @@ impl Engine {
             .map(|id| ticket.assignments.iter().any(|a| &a.id == id && !a.is_root()))
             .unwrap_or(false);
         // Checkpoint and propose modes mean a person reviews before the work counts as done.
-        if report.state == ReportState::Ready
-            && !targets_child
-            && ticket.mandate.mode != Mode::Autonomous
-            && ticket.approved_checkpoints.is_empty()
-        {
-            return Err(UserError::new(ErrorCode::CheckpointRequired).with("mode", ticket.mandate.mode.as_str()));
+        if report.state == ReportState::Ready && !targets_child && ticket.mandate.mode != Mode::Autonomous {
+            let missing: Vec<&str> = ticket
+                .required_checkpoints
+                .iter()
+                .filter(|name| !ticket.approved_checkpoints.contains(name))
+                .map(String::as_str)
+                .collect();
+            if ticket.approved_checkpoints.is_empty() || !missing.is_empty() {
+                let mut error = UserError::new(ErrorCode::CheckpointRequired).with("mode", ticket.mandate.mode.as_str());
+                if !missing.is_empty() {
+                    error = error.with("checkpoints", &missing.join(", "));
+                }
+                return Err(error);
+            }
         }
         let at = self.now();
         let index = match &report.assignment_id {
@@ -188,6 +196,17 @@ impl Engine {
             },
         };
         ticket.attention = attention;
+        self.emit(DomainEvent::Reported {
+            ticket_id: ticket_id.to_string(),
+            assignment_id: ticket.assignments[index].id.clone(),
+            role: ticket.assignments[index].role.clone(),
+            state: report.state,
+            summary: report.summary.clone(),
+            question: match &report.question {
+                Question::Ask(q) => Some(q.clone()),
+                _ => None,
+            },
+        });
         ticket.assignments[index].report = Some(Report {
             state: report.state,
             summary: report.summary,

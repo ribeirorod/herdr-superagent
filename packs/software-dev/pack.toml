@@ -1,0 +1,4 @@
+id = "software-dev"
+version = "1"
+description = "Software delivery in a repository: plan, build in a worktree, review in a sibling pane, deliver a branch."
+default_workflow = "feature"

@@ -121,6 +121,15 @@ pub enum MandateBasis {
     },
 }
 
+/// How a kind of work runs, from the workflow pack: who starts and where a person reviews.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkPlan {
+    pub workflow: Option<String>,
+    pub pack: Option<String>,
+    pub root_role: String,
+    pub required_checkpoints: Vec<String>,
+}
+
 /// Immutable authorization produced by an accept; execution is bounded by it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mandate {
@@ -466,6 +475,12 @@ pub struct Ticket {
     /// Names of the checkpoints a person approved, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_checkpoints: Vec<String>,
+    /// The workflow pack and version the ticket runs under (`software-dev@1/feature`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<String>,
+    /// Checkpoints the workflow declares: outside autonomous mode the ticket cannot end before each was approved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_checkpoints: Vec<String>,
     pub assignments: Vec<Assignment>,
     pub inputs: Vec<TicketInput>,
     /// Inputs not yet handed to a running assignment.

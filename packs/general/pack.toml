@@ -1,0 +1,4 @@
+id = "general"
+version = "1"
+description = "One worker per ticket: anything that is not software delivery. Research, writing, triage, analysis."
+default_workflow = "general"

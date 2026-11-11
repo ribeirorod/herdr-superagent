@@ -1,0 +1,10 @@
+id = "feature"
+description = "Plan, build, independent review, deliver the branch."
+match = { keywords = ["feature", "implement", "add", "build", "refactor", "support", "migrate", "upgrade", "endpoint", "api", "ui"] }
+steps = [
+  { role = "worker", goal = "Plan with acceptance criteria", checkpoint = "plan" },
+  { role = "worker", goal = "Implement in the worktree, with tests" },
+  { role = "reviewer", goal = "Review the diff against its base", spawn = true },
+  { role = "worker", goal = "Fix what the review found, run the full checks", checkpoint = "implemented" },
+  { role = "worker", goal = "Push the branch; open a pull request only if the request asks for one", risk = ["remote-write"] },
+]

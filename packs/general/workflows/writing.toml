@@ -1,0 +1,9 @@
+id = "writing"
+description = "Draft a text, stop for review of the outline, then write."
+match = { keywords = ["write", "draft", "document", "readme", "blog", "post", "email", "announcement", "proposal"] }
+steps = [
+  { role = "worker", goal = "Outline: audience, points, sources", checkpoint = "plan" },
+  { role = "worker", goal = "Write the draft" },
+  { role = "reviewer", goal = "Read the draft for accuracy and clarity; report findings" },
+  { role = "worker", goal = "Apply the review and deliver" },
+]

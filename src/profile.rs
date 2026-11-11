@@ -39,6 +39,15 @@ pub struct Profile {
 pub struct HarnessFlags {
     /// Mark each new worktree as trusted in the harness's own config, so no trust dialog stops the worker.
     pub pre_trust: bool,
+    /// Keep the person's global harness settings (output style, hooks) out of the
+    /// session and the workers: Claude then loads project and local settings only.
+    pub isolate_settings: bool,
+    /// Flags the superagent session always starts with, per harness. The default
+    /// takes Claude's own subagents away, so routing cannot turn into doing the work.
+    pub session: std::collections::BTreeMap<String, Vec<String>>,
+    /// Flags every worker starts with, per harness. The default takes Claude's own
+    /// subagents away, so a worker delegates with `spawn`, where you can see it.
+    pub worker: std::collections::BTreeMap<String, Vec<String>>,
     pub autonomous: std::collections::BTreeMap<String, Vec<String>>,
     pub checkpoint: std::collections::BTreeMap<String, Vec<String>>,
     pub propose: std::collections::BTreeMap<String, Vec<String>>,
@@ -49,8 +58,16 @@ impl Default for HarnessFlags {
         let mut autonomous = std::collections::BTreeMap::new();
         autonomous.insert("claude".to_string(), vec!["--dangerously-skip-permissions".to_string()]);
         autonomous.insert("codex".to_string(), vec!["--full-auto".to_string()]);
+        let mut no_subagents = std::collections::BTreeMap::new();
+        no_subagents.insert(
+            "claude".to_string(),
+            vec!["--disallowedTools".to_string(), "Task,Agent".to_string()],
+        );
         HarnessFlags {
             pre_trust: false,
+            isolate_settings: false,
+            session: no_subagents.clone(),
+            worker: no_subagents,
             autonomous,
             checkpoint: Default::default(),
             propose: Default::default(),
@@ -172,6 +189,18 @@ pub struct StateRepo {
     pub kind: String,
     pub remote: String,
     pub branch: String,
+}
+
+impl HarnessFlags {
+    /// The flags a harness starts with besides its model and mode: `who` is `session` or `worker`.
+    pub fn always(&self, harness: &str, who: &str) -> Vec<String> {
+        let table = if who == "session" { &self.session } else { &self.worker };
+        let mut flags = table.get(harness).cloned().unwrap_or_default();
+        if self.isolate_settings && harness == "claude" {
+            flags.extend(["--setting-sources".to_string(), "project,local".to_string()]);
+        }
+        flags
+    }
 }
 
 impl Default for SuperagentSection {
@@ -604,13 +633,24 @@ impl ProfileStore {
 /// while the daemon runs (`profile set` → `profile_reload`).
 pub struct ProfilePolicy {
     profile: RefCell<Profile>,
+    /// Where the profile's own workflow packs live.
+    profile_dir: PathBuf,
 }
 
 impl ProfilePolicy {
-    pub fn new(profile: Profile) -> ProfilePolicy {
+    pub fn new(profile: Profile, profile_dir: &Path) -> ProfilePolicy {
         ProfilePolicy {
             profile: RefCell::new(profile),
+            profile_dir: profile_dir.to_path_buf(),
         }
+    }
+    /// The workflow packs as they are on disk now.
+    pub fn packs(&self) -> Vec<crate::packs::Pack> {
+        let (packs, problems) = crate::packs::load(&self.profile_dir);
+        for problem in problems {
+            tracing::warn!(%problem, "skipping an invalid workflow pack");
+        }
+        packs
     }
     pub fn snapshot(&self) -> Profile {
         self.profile.borrow().clone()
@@ -656,6 +696,39 @@ impl Policy for ProfilePolicy {
     }
     fn mode_for(&self, request: &Request, proposed: Option<Mode>) -> Mode {
         self.profile.borrow().mode_for(request, proposed)
+    }
+    fn plan_for(&self, request: &Request, workflow: Option<&str>, title: &str) -> WorkPlan {
+        let packs = self.packs();
+        let in_repo = request
+            .project
+            .as_deref()
+            .map(|p| Path::new(&expand_home(p)).join(".git").exists())
+            .unwrap_or(false);
+        // A named workflow the packs know wins; an unknown name is kept as a label and
+        // runs as the nearest thing the text suggests.
+        let chosen = workflow.and_then(|name| crate::packs::find(&packs, name)).or_else(|| {
+            let (id, _) = crate::packs::score(&packs, &format!("{title}\n{}", request.text), in_repo);
+            crate::packs::find(&packs, &id)
+        });
+        match chosen {
+            Some(chosen) => WorkPlan {
+                workflow: Some(
+                    workflow
+                        .filter(|w| crate::packs::find(&packs, w).is_none())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| chosen.workflow.id.clone()),
+                ),
+                pack: Some(chosen.label()),
+                root_role: chosen.root_role(),
+                required_checkpoints: chosen.required_checkpoints(),
+            },
+            None => WorkPlan {
+                workflow: workflow.map(str::to_string),
+                pack: None,
+                root_role: "worker".into(),
+                required_checkpoints: Vec::new(),
+            },
+        }
     }
 }
 
