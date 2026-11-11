@@ -1,7 +1,11 @@
 # Live test plan (for the agent on the machine with herdr)
 
 Everything below has passed unit tests and an end-to-end run against a fake
-herdr. None of it has run in a live herdr since phase 3. Work through it in
+herdr. On 2026-11-11 sections 2, 4 and most of 6 also passed in a live herdr
+0.9.5 on Linux with Claude Code (see `phase-4.md` for the table). Still open
+there: macOS, your real settings and logins, guard shims with a real
+autonomous worker (5), sources (7), the importer on your real transcripts
+(8), tidy and the server restart (9), and calibration (3). Work through it in
 order; each step says what to do and what must be true. Report per step:
 pass, or fail with the output and `herdr-superagent --profile test logs
 --lines 200`. On any failure also attach `debug-bundle`.

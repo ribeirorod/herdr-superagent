@@ -71,7 +71,13 @@ pub fn ticket_message(ticket: &Ticket, bin: &str) -> String {
                 .and_then(|e| e.branch.as_deref())
                 .map(|b| format!(" Branch: {b}."))
                 .unwrap_or_default();
-            let last = ticket.latest_report().map(|r| r.summary.clone()).unwrap_or_default();
+            // The ticket's own worker has the last word, not a reviewer it spawned.
+            let last = ticket
+                .latest_assignment()
+                .and_then(|a| a.report.as_ref())
+                .or(ticket.latest_report())
+                .map(|r| r.summary.clone())
+                .unwrap_or_default();
             format!("{head} ended: {outcome}.{branch}{}\nTell the person the result in two lines.", summary(&last))
         }
         TicketStage::Person { action } => match action {

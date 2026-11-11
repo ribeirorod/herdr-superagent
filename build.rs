@@ -27,4 +27,9 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=build.rs");
+    // An uncommitted change is a new build too: without this a rebuilt binary kept
+    // the old id and `ensure` left the old daemon running.
+    for dir in ["src", "packs", "skills"] {
+        println!("cargo:rerun-if-changed={dir}");
+    }
 }

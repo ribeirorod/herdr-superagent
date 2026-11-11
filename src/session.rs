@@ -101,7 +101,7 @@ pub fn start(profile_name: &str, harness: Option<String>, model: Option<String>,
     }
 
     let mut args = calibration::model_args(&harness, &model);
-    args.extend(profile.harness_flags.always(&harness, "session"));
+    args.extend(profile.harness_flags.always(&harness, "session", &paths.state_dir()));
     // The pane's shell may have a short PATH: export the login shell's before the harness starts.
     let exports = [
         format!("PATH={}", crate::envpath::full_path()),

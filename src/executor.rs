@@ -42,7 +42,16 @@ pub struct WorkerSeen {
     /// The completion_seq we already asked a status report for.
     pub status_asked_for: Option<u64>,
     pub title: String,
+    /// Since when the worker has sat idle without ever finishing a turn or reporting.
+    pub never_started_since: Option<Instant>,
+    /// How often the brief was sent again because of that.
+    pub rebriefs: u8,
 }
+
+/// A worker that is idle this long after its brief, without one finished turn, never took it
+/// (a start-up screen swallowed the prompt): the brief is sent again.
+pub const REBRIEF_AFTER: Duration = Duration::from_secs(25);
+pub const MAX_REBRIEFS: u8 = 3;
 
 /// What the observer wants done for a worker, decided by `assess` (pure, tested).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +62,10 @@ pub enum Action {
     /// The turn ended with no report since the last delivery: record `waiting` and ask for a status.
     ReportWaitingAndAsk,
     ReportFailed(String),
+    /// The brief never arrived: send it again.
+    Rebrief,
+    /// It still has not started after several briefs: a person has to look at the pane.
+    ReportNeverStarted,
 }
 
 /// Decides what a status change means for a running worker.
@@ -90,7 +103,21 @@ pub fn assess(
                 actions.push(Action::ReportProgress("continued after a dialog".into()));
             }
         }
+        "idle" | "done" if completion_seq.is_none() && latest_report.is_none() => {
+            let since = *seen.never_started_since.get_or_insert(now);
+            if now.duration_since(since) >= REBRIEF_AFTER {
+                seen.never_started_since = Some(now);
+                if seen.rebriefs < MAX_REBRIEFS {
+                    seen.rebriefs += 1;
+                    actions.push(Action::Rebrief);
+                } else if seen.rebriefs == MAX_REBRIEFS {
+                    seen.rebriefs += 1;
+                    actions.push(Action::ReportNeverStarted);
+                }
+            }
+        }
         "idle" | "done" => {
+            seen.never_started_since = None;
             let turn_ended = matches!((prev.and_then(|p| p.completion_seq), completion_seq), (Some(a), Some(b)) if b > a)
                 || (prev.map(|p| p.status == "working").unwrap_or(false) && completion_seq.is_some());
             if turn_ended {
@@ -509,7 +536,7 @@ impl Daemon {
         std::thread::sleep(Duration::from_millis(300));
 
         let mut args = crate::calibration::model_args(&harness, &model);
-        args.extend(profile.harness_flags.always(&harness, "worker"));
+        args.extend(profile.harness_flags.always(&harness, "worker", &self.paths.state_dir()));
         args.extend(mode_flags(&profile, &harness, effective_mode));
         let name = worker_name(&self.paths.profile, &ticket.id, &tab);
         if let Err(e) = herdr.call(
@@ -575,6 +602,8 @@ impl Daemon {
                 no_agent_since: None,
                 status_asked_for: None,
                 title: String::new(),
+                never_started_since: None,
+                rebriefs: 0,
             },
         );
         tracing::info!(target: "executor", ticket = %ticket.id, %harness, %model, pane = %pane_id, mode = %ticket.mandate.mode, "worker launched");
@@ -732,6 +761,8 @@ impl Daemon {
                 no_agent_since: None,
                 status_asked_for: None,
                 title: String::new(),
+                never_started_since: None,
+                rebriefs: 0,
             });
             if !panes.iter().any(|p| p.pane_id == pane_id) {
                 drop(workers);
@@ -828,6 +859,30 @@ impl Daemon {
                             .and_then(|_| self.engine.request_status(&ticket.id))
                             .map(|_| ())
                     }
+                    Action::Rebrief => {
+                        let brief = self.brief_path(&ticket.id, &assignment.id);
+                        let text = if assignment.is_root() {
+                            format!("Read {} and start on ticket {}.", brief.display(), ticket.id)
+                        } else {
+                            format!("Read {} and do the task it gives you for ticket {}.", brief.display(), ticket.id)
+                        };
+                        if let Err(e) = herdr.call("agent.prompt", json!({ "target": pane_id, "text": text })) {
+                            tracing::debug!(target: "executor", %e, "rebrief not taken yet");
+                        }
+                        Ok(())
+                    }
+                    Action::ReportNeverStarted => self
+                        .engine
+                        .report(
+                            &ticket.id,
+                            WorkerReport {
+                                state: ReportState::Blocked,
+                                summary: "the worker never started on its brief: look at its pane (a start-up or login screen may be open), then `retry`".into(),
+                                question: Question::Keep,
+                                assignment_id: Some(assignment.id.clone()),
+                            },
+                        )
+                        .map(|_| ()),
                     Action::ReportFailed(summary) => self
                         .engine
                         .report(
@@ -877,7 +932,52 @@ mod tests {
             no_agent_since: None,
             status_asked_for: None,
             title: String::new(),
+            never_started_since: None,
+            rebriefs: 0,
         }
+    }
+
+    #[test]
+    fn a_worker_that_never_took_its_brief_is_briefed_again_then_handed_to_the_person() {
+        let start = Instant::now();
+        let mut state = seen("starting", None);
+        // Idle right after the brief: give it time.
+        assert!(assess(None, "idle", None, false, None, start, &mut state).is_empty());
+        let mut at = start;
+        for n in 1..=MAX_REBRIEFS {
+            at += REBRIEF_AFTER;
+            let prev = state.clone();
+            assert_eq!(
+                assess(Some(&prev), "idle", None, false, None, at, &mut state),
+                vec![Action::Rebrief],
+                "rebrief {n}"
+            );
+        }
+        at += REBRIEF_AFTER;
+        let prev = state.clone();
+        assert_eq!(
+            assess(Some(&prev), "idle", None, false, None, at, &mut state),
+            vec![Action::ReportNeverStarted]
+        );
+        at += REBRIEF_AFTER;
+        let prev = state.clone();
+        assert!(
+            assess(Some(&prev), "idle", None, false, None, at, &mut state).is_empty(),
+            "said once"
+        );
+        // A worker that finished a turn or reported is never treated as not started.
+        let mut working = seen("working", Some(3));
+        let prev = working.clone();
+        let actions = assess(
+            Some(&prev),
+            "idle",
+            Some(4),
+            true,
+            Some(ReportState::Progress),
+            start + REBRIEF_AFTER * 4,
+            &mut working,
+        );
+        assert!(!actions.contains(&Action::Rebrief));
     }
 
     #[test]

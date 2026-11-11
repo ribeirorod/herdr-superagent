@@ -255,9 +255,17 @@ pub struct StateRepo {
 
 impl HarnessFlags {
     /// The flags a harness starts with besides its model and mode: `who` is `session` or `worker`.
-    pub fn always(&self, harness: &str, who: &str) -> Vec<String> {
+    pub fn always(&self, harness: &str, who: &str, state_dir: &Path) -> Vec<String> {
         let table = if who == "session" { &self.session } else { &self.worker };
         let mut flags = table.get(harness).cloned().unwrap_or_default();
+        if harness == "claude" {
+            // The plugin's own CLI never needs a permission prompt: reports, checkpoints and
+            // routing would otherwise stop at one each time. Everything else still asks.
+            let bin = crate::envpath::self_path();
+            flags.extend(["--allowedTools".to_string(), format!("Bash(herdr-superagent:*),Bash({bin}:*)")]);
+            // Briefs live in the plugin's state directory, outside the pane's own folder.
+            flags.extend(["--add-dir".to_string(), state_dir.display().to_string()]);
+        }
         if self.isolate_settings && harness == "claude" {
             flags.extend(["--setting-sources".to_string(), "project,local".to_string()]);
         }

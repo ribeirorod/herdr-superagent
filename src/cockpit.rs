@@ -132,6 +132,13 @@ impl App {
         let again = keep.and_then(|id| self.rows.iter().position(|row| self.row_id(row).as_deref() == Some(id.as_str())));
         self.selected = again.unwrap_or(self.selected);
         self.clamp();
+        // Resting on a finished ticket while something needs you: go to what needs you.
+        let on_ended = self.ticket().map(|t| stage(t) == "ended").unwrap_or(false);
+        let needs_you = matches!(self.rows.first(), Some(Row::Section(title, _)) if title == "NEEDS YOU");
+        if on_ended && needs_you && self.prompt.is_none() {
+            self.selected = 0;
+            self.clamp();
+        }
     }
 
     fn row_id(&self, row: &Row) -> Option<String> {
@@ -536,9 +543,14 @@ pub fn detail(app: &App) -> Vec<Line<'static>> {
     if let Some(error) = ticket.pointer("/delivery/error").and_then(Value::as_str) {
         lines.push(label("delivery", error.to_string()));
     }
-    let report = ticket["assignments"]
-        .as_array()
-        .and_then(|a| a.iter().rev().find_map(|x| x.get("report").filter(|r| !r.is_null())));
+    // The ticket's own worker has the word; a spawned child's report only until it has one.
+    let report = ticket["assignments"].as_array().and_then(|a| {
+        a.iter()
+            .rev()
+            .filter(|x| x["parent"].is_null())
+            .find_map(|x| x.get("report").filter(|r| !r.is_null()))
+            .or_else(|| a.iter().rev().find_map(|x| x.get("report").filter(|r| !r.is_null())))
+    });
     if let Some(report) = report {
         lines.push(label(
             "report",

@@ -54,19 +54,47 @@ without end; an approved guard checkpoint held the same command back again.
 
 ## What has been run, and where
 
-| Part | Unit tests | End to end (fake herdr) | Live herdr |
-|---|---|---|---|
-| Launch, brief, checkpoints, approve | yes | yes | yes (phases 2 and 3) |
-| Revise, request-changes, retitle | yes | yes | no |
-| Spawned reviewer, child brief and report | yes | yes | no |
-| Guard shims and the one-time permit | yes | yes | no |
-| Session messages and the routing switch | yes | yes | no |
-| Packs, scorer, required checkpoints | yes | yes | no |
-| Sources | yes | yes (`command`, `session`) | no (`github` needs `gh`) |
-| Importer and semantic search | yes | yes | no (run on synthetic transcripts) |
-| Cockpit | yes | in a pty against a real daemon | no |
-| `workspace.rename`, `agent.focus`, `--disallowedTools` | - | - | no: names taken from herdr's and Claude's docs |
-| Restart smoke test (`scripts/smoke-restart.sh`) | - | - | never run |
+On 2026-11-11 the plugin ran inside a live herdr 0.9.5 on Linux (built from
+source), with Claude Code 2.1 as the harness for the session, a worker and a
+reviewer. Two tickets went through: one submitted from a shell, one typed to
+the session.
 
-A herdr binary cannot be built in the environment this was written in, so
-everything in the last column is for the next live round.
+| Part | Unit tests | End to end (fake herdr) | Live herdr 0.9.5 (Linux) |
+|---|---|---|---|
+| Socket discovery from a shell outside herdr | yes | - | yes |
+| Launch in its own workspace and worktree, brief, plan checkpoint, approve | yes | yes | yes |
+| Worker looks at branches, pull requests, your checkout, memory | - | brief text | yes: its plan listed each |
+| Spawned reviewer: own tab, own brief, report back to the worker | yes | yes | yes |
+| Workflow's required checkpoints, then `ready` ends the ticket | yes | yes | yes |
+| Session start, routing brief, no permission prompts for the plugin's CLI | - | - | yes |
+| A typed request: session submits and routes it with the repository | - | - | yes |
+| Daemon tells the session: checkpoint, result; session does not approve | yes | yes | yes |
+| `retitle` renames the workspace (`workspace.rename`) | yes | refusal path | yes |
+| Daemon stop/start re-attaches to a live worker pane | - | - | yes |
+| A rebuilt binary restarts daemon and cockpit | - | - | yes |
+| A brief swallowed by a start-up screen is sent again | yes | - | yes |
+| Cockpit in its pane; approve by key | yes | pty | yes |
+| The skill is installed into the harness's skills directory | - | - | yes |
+| `--disallowedTools Task,Agent`, `--allowedTools`, `--add-dir` accepted by Claude | - | - | yes |
+| Summaries stored by the workers and found by `memory search` | yes | yes | yes |
+| Guard shims and the one-time permit | yes | yes | no (Claude refuses its skip-permissions flag as root here) |
+| Sources | yes | yes (`command`, `session`) | no |
+| Importer on real transcripts, Ollama embedder | yes (synthetic) | yes (synthetic) | no |
+| Calibration interview, `isolate_settings`, cockpit `o` (focus), mouse | partly | - | no |
+| macOS, Codex and Pi as harnesses | CI (macOS) | CI (macOS) | no |
+| Restart of the herdr server (`scripts/smoke-restart.sh`) | - | - | no |
+
+Found and fixed during the live run:
+
+- A fresh Claude shows a welcome screen that herdr reports as idle; the brief
+  was typed into it and lost. The observer now sends the brief again when a
+  worker sits idle without ever finishing a turn, and hands the ticket to the
+  person after three tries.
+- The session and the workers stopped at Claude's permission prompt for the
+  plugin's own CLI and for reading their brief. Both are allowed at launch now
+  (`--allowedTools` for the CLI, `--add-dir` for the state directory).
+- A binary rebuilt from uncommitted changes kept its build id, so `ensure`
+  left the old daemon running. The id now changes with the sources.
+- The result message and the ticket line quoted the reviewer's report instead
+  of the worker's own final one.
+- The cockpit stayed on a finished ticket when a new one needed the person.

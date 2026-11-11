@@ -1505,7 +1505,14 @@ fn status_text(status: &Value) -> String {
 fn ticket_line(ticket: &Value) -> String {
     let report = ticket["assignments"]
         .as_array()
-        .and_then(|a| a.iter().rev().find_map(|x| x.get("report").filter(|r| !r.is_null())))
+        .and_then(|a| {
+            // The ticket's own worker first; a spawned child's report only when it has none yet.
+            a.iter()
+                .rev()
+                .filter(|x| x["parent"].is_null())
+                .find_map(|x| x.get("report").filter(|r| !r.is_null()))
+                .or_else(|| a.iter().rev().find_map(|x| x.get("report").filter(|r| !r.is_null())))
+        })
         .map(|r| {
             format!(
                 "{}: {}",
