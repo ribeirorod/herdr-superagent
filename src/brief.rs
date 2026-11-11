@@ -9,7 +9,7 @@ pub fn mode_rules(mode: Mode) -> &'static str {
     match mode {
         Mode::Propose => "**Propose mode: plan only.** Investigate, write the plan, then `herdr-superagent checkpoint plan --summary \"…\"` and end your turn. Do not change files, run migrations, push or send anything until the plan is approved.",
         Mode::Checkpoint => "**Checkpoint mode.** Your **first checkpoint is `plan`**, before you change any file: investigate, write the plan, run `herdr-superagent checkpoint plan --summary \"…\"` and end your turn. After approval, work and stop again at milestones (`checkpoint implemented`, `checkpoint tested`) and before any risky action (pushing, deploying, deleting, sending messages, spending). A `ready` report is refused until a checkpoint was approved. The harness's own permission prompts stay on.",
-        Mode::Autonomous => "**Autonomous mode.** Run end to end and report when done. Still: never push to a default branch, never delete outside your worktree, never send messages or spend money unless the request says so explicitly.",
+        Mode::Autonomous => "**Autonomous mode.** Run end to end and report when done: plan, build, test and push your own branch without waiting. Your worktree and branch are yours; for a separate piece of work, make another branch from them. Still, in every mode: **never push or merge to the default branch, `main` or `master`**, never delete outside your worktree, never send messages or spend money unless the request says so explicitly. A push or merge to a protected branch is held back as a checkpoint for the person, however you run it.",
     }
 }
 
@@ -28,7 +28,7 @@ pub fn branch_rules(ticket: &Ticket) -> String {
         .unwrap_or_default();
     match ticket.execution.as_ref().and_then(|e| e.branch.as_deref()) {
         Some(branch) => format!(
-            "{start}You work in a worktree on branch `{branch}`. Commit as you go. At every checkpoint and before your final report, push the branch (`git push -u origin {branch}`) when the repository has a remote; never push to the default branch, and never open a pull request unless the request asks for one. Put the branch and the last commit in your final report."
+            "{start}You work in a worktree on branch `{branch}`. Commit as you go. At every checkpoint and before your final report, push the branch (`git push -u origin {branch}`) when the repository has a remote; never push or merge to the default branch, `main` or `master` (a guard holds that back as a checkpoint for the person, in every mode), and never open a pull request unless the request asks for one. Put the branch and the last commit in your final report."
         ),
         None => "This ticket has no repository branch. Put the files you produced in your final report.".to_string(),
     }

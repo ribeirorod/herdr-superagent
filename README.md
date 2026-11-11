@@ -37,9 +37,30 @@ checkpoint, a question, a failure, a result.
 
 **Modes decide how much you review.** `propose` plans only; `checkpoint`
 (the default) stops at the plan and at milestones; `autonomous` runs end to
-end behind guard shims that turn `git push` to a default branch, force
-pushes, `gh pr merge` and `rm -r` outside the worktree into checkpoints. The
-profile caps the mode per workflow and per repository.
+end in its own worktree and branch and reports when done. The profile sets
+the default and a cap, per workflow and per repository.
+
+You switch the mode of the next work from wherever you are: tell the
+superagent ("do the next one autonomously", "plan only from now on", "back
+to normal"), press `m` in the cockpit, or run it yourself:
+
+```text
+herdr-superagent mode                       # what the next ticket runs in, and the profile's default and cap
+herdr-superagent mode autonomous --once     # the next ticket only
+herdr-superagent mode propose               # until you change it
+herdr-superagent mode default               # back to the profile's
+herdr-superagent submit "…" --mode checkpoint   # one request, named on the request
+```
+
+**No mode pushes or merges to `main` without you.** Every worker, in every
+mode, runs behind two rails. Shims for `git`, `gh`, `bb` and `rm` turn a push
+or merge to a protected branch (the default branch, `main`, `master`), force
+pushes, `gh pr merge`, writes to your own checkout and `rm -r` outside the
+worktree into a checkpoint. A `pre-push` hook, in force for the worker's pane
+only, stops a push to a protected branch however git was started, and still
+runs your repository's own hooks. An approved guard checkpoint lets exactly
+that command through, once. They are rails, not a sandbox: turn on branch
+protection on the remote as well.
 
 ```text
 herdr-superagent approve <id> [--comment "…"]      # the worker continues

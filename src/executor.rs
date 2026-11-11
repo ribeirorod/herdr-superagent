@@ -503,12 +503,19 @@ impl Daemon {
         }
 
         let effective_mode = assignment.mode.unwrap_or(ticket.mandate.mode);
-        // Autonomous workers get the guard shims first on PATH (PLAN §6).
+        // Every worker gets the guard rails, whatever its mode (PLAN §6): the shims first on
+        // PATH, and for a repository a pre-push hook that git itself runs.
         let mut worker_path = crate::envpath::full_path();
-        if effective_mode == Mode::Autonomous {
-            match crate::guard::write_shims(&self.paths.state_dir().join("shims"), &crate::envpath::self_path()) {
-                Ok(dir) => worker_path = format!("{}:{worker_path}", dir.display()),
-                Err(e) => tracing::warn!(%e, "could not write guard shims"),
+        match crate::guard::write_shims(&self.paths.state_dir().join("shims"), &crate::envpath::self_path()) {
+            Ok(dir) => worker_path = format!("{}:{worker_path}", dir.display()),
+            Err(e) => tracing::warn!(%e, "could not write guard shims"),
+        }
+        let mut hooks_dir = None;
+        if ticket.execution.as_ref().and_then(|e| e.branch.as_ref()).is_some() {
+            let dir = self.paths.state_dir().join("hooks").join(short_id(&ticket.id));
+            match crate::guard::write_hooks(&dir, &crate::envpath::self_path(), std::path::Path::new(&directory)) {
+                Ok(dir) => hooks_dir = Some(dir),
+                Err(e) => tracing::warn!(%e, "could not write the pre-push guard"),
             }
         }
         // The worker's environment, through its shell, since agent.start takes none.
@@ -533,6 +540,14 @@ impl Daemon {
             }
         }
         exports.extend(profile.harness_flags.exports(&profile.memory));
+        if let Some(dir) = &hooks_dir {
+            // In force for this pane only: the repository's own configuration is not touched.
+            exports.extend([
+                "GIT_CONFIG_COUNT=1".to_string(),
+                "GIT_CONFIG_KEY_0=core.hooksPath".to_string(),
+                format!("GIT_CONFIG_VALUE_0={}", dir.display()),
+            ]);
+        }
         let line = format!("export {}; clear", shell_words(&exports));
         if let Err(e) = herdr.pane_run(&pane_id, &line) {
             return Outcome::Fail(format!("export env: {e}"));

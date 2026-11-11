@@ -134,6 +134,20 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// pre-push hook target: no protected branch is updated without an approved checkpoint.
+    #[command(hide = true)]
+    GuardPush {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// The mode the next tickets run in: `mode` shows it, `mode autonomous`, `mode propose --once`, `mode default`.
+    Mode {
+        /// propose, checkpoint, autonomous, or `default` to go back to the profile's.
+        mode: Option<String>,
+        /// Only for the next ticket.
+        #[arg(long)]
+        once: bool,
+    },
     /// The sidebar Agents view for this profile: `view set`, `view clear`, `view snippet`.
     View {
         #[command(subcommand)]
@@ -1026,6 +1040,31 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             }
         }
         Command::Guard { tool, args } => guard(&paths, &tool, &args),
+        Command::GuardPush { .. } => guard_push(&paths),
+        Command::Mode { mode, once } => {
+            let value = match mode {
+                Some(mode) => daemon("mode_set", json!({ "mode": mode, "once": once }))?,
+                None => daemon("mode_get", json!({}))?,
+            };
+            let mut text = format!("next ticket runs in {} mode", value["effective"].as_str().unwrap_or(""));
+            match (value["chosen"].as_str(), value["once"].as_bool().unwrap_or(false)) {
+                (Some(_), true) => text.push_str(" (this once, then back to the profile's default)"),
+                (Some(_), false) => text.push_str(" (until you change it: `mode default` goes back)"),
+                (None, _) => text.push_str(" (the profile's default)"),
+            }
+            if let Some(capped) = value["capped_from"].as_str() {
+                text.push_str(&format!(
+                    "\nyou asked for {capped}; the profile caps it at {}",
+                    value["cap"].as_str().unwrap_or("")
+                ));
+            }
+            text.push_str(&format!(
+                "\nprofile: default {}, cap {}. A rule for a workflow or repository can make a ticket stricter; nothing makes it looser than the cap.",
+                value["default"].as_str().unwrap_or(""),
+                value["cap"].as_str().unwrap_or("")
+            ));
+            out(value, text)
+        }
         Command::View { action } => {
             let herdr = crate::herdr::Herdr::from_env().map_err(|e| e.to_string())?;
             let source = format!(
@@ -1385,9 +1424,54 @@ fn guard(paths: &Paths, tool: &str, args: &[String]) -> Result<i32, String> {
             return Ok(75);
         }
         eprintln!("superagent guard: `{command}` was approved; running it.");
+        // The pre-push hook asks about the same push: it was just answered.
+        std::env::set_var("HERDR_SUPERAGENT_PUSH_OK", "1");
     }
     let error = std::process::Command::new(real).args(args).exec();
     Err(format!("guard: exec {tool}: {error}"))
+}
+
+/// The pre-push hook: git gives the refs a push would update on stdin. A protected branch
+/// among them needs an approved checkpoint, however git was started.
+fn guard_push(paths: &Paths) -> Result<i32, String> {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    if std::env::var("HERDR_SUPERAGENT_PUSH_OK").as_deref() == Ok("1") {
+        return Ok(0);
+    }
+    let Some(ticket) = std::env::var("SUPERAGENT_TICKET").ok().filter(|t| !t.is_empty()) else {
+        return Ok(0);
+    };
+    let worktree = std::env::var("SUPERAGENT_WORKTREE")
+        .ok()
+        .filter(|w| !w.is_empty())
+        .map(std::path::PathBuf::from);
+    std::env::set_var("PATH", crate::guard::path_without(&paths.state_dir().join("shims")));
+    let default = crate::guard::default_branch(worktree.as_deref());
+    let refs = crate::guard::protected_pushes(&input, &default);
+    if refs.is_empty() {
+        return Ok(0);
+    }
+    let command = format!("git push to {}", refs.join(", "));
+    let call = |method: &str, params: Value| ipc::call(&paths.socket_path(), method, params, Duration::from_secs(10));
+    let permitted = call("guard_permit", json!({ "ticket": ticket, "command": command }))
+        .ok()
+        .and_then(|v| v["permitted"].as_bool())
+        .unwrap_or(false);
+    if permitted {
+        eprintln!("superagent guard: {command} was approved.");
+        return Ok(0);
+    }
+    let held = call(
+        "guard_hold",
+        json!({ "ticket": ticket, "tool": "git", "command": command, "reason": "a protected branch is never pushed without approval", "assignment": std::env::var("SUPERAGENT_ASSIGNMENT").ok() }),
+    );
+    match held {
+        Ok(_) => eprintln!("superagent guard: {command} held back. A checkpoint was recorded: end your turn and wait for approval, then push again. Deliver work on your own branch, or as a pull request."),
+        Err(e) => eprintln!("superagent guard: {command} held back; could not record a checkpoint: {e}. Report blocked and end your turn."),
+    }
+    Ok(1)
 }
 
 /// Collects everything needed to debug a session into one tar.gz.

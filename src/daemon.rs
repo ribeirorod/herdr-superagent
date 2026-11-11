@@ -766,6 +766,19 @@ impl Daemon {
             "stop_ticket" => Ok(ticket_view(
                 &self.engine.stop_ticket(str_param(params, "ticket")?, opt_param(params, "reason"))?,
             )),
+            "mode_get" => Ok(self.mode_view(None)),
+            "mode_set" => {
+                let name = str_param(params, "mode")?;
+                let once = params.get("once").and_then(Value::as_bool).unwrap_or(false);
+                if name == "default" {
+                    self.store.kv_set("mode.chosen", "");
+                    return Ok(self.mode_view(None));
+                }
+                let mode: Mode = name.parse().map_err(UserError::internal)?;
+                self.store
+                    .kv_set("mode.chosen", &format!("{}{}", mode.as_str(), if once { ":once" } else { "" }));
+                Ok(self.mode_view(Some(mode)))
+            }
             "sources" => Ok(self.sources_view()),
             "sources_poll" => {
                 let only = opt_param(params, "id");
@@ -929,6 +942,7 @@ impl Daemon {
             "pid": std::process::id(),
             "started_at": self.started_at,
             "paused": self.policy.paused(),
+            "mode": self.mode_view(None),
             "policy_version": self.policy.version(),
             "herdr": self.herdr.is_some(),
             "pane_id": self.pane_id,
@@ -1064,6 +1078,8 @@ impl Daemon {
         let mut result = json!({ "request_id": id, "received": format!("{received:?}").to_lowercase() });
         // A request that names its workflow skips routing (PLAN §8).
         if let Some(workflow) = workflow {
+            self.apply_chosen_mode(&id, mode.is_some());
+            let mode = mode.or_else(|| self.store.request_get(&id).and_then(|r| r.mode));
             let title: String = text.lines().next().unwrap_or("").chars().take(72).collect();
             let outcome = Outcome::Accept {
                 title,
@@ -1090,6 +1106,46 @@ impl Daemon {
         }
         self.register(true);
         Ok(result)
+    }
+
+    /// The mode chosen for the next tickets in this session, and whether it holds for one ticket only.
+    fn chosen_mode(&self) -> Option<(Mode, bool)> {
+        let stored = self.store.kv_get("mode.chosen").filter(|v| !v.is_empty())?;
+        let (name, once) = match stored.strip_suffix(":once") {
+            Some(name) => (name, true),
+            None => (stored.as_str(), false),
+        };
+        name.parse().ok().map(|mode| (mode, once))
+    }
+
+    fn mode_view(&self, asked: Option<Mode>) -> Value {
+        let profile = self.policy.snapshot();
+        let chosen = self.chosen_mode();
+        let wanted = chosen.map(|(m, _)| m).unwrap_or(profile.modes.default);
+        let effective = wanted.stricter(profile.modes.cap);
+        json!({
+            "effective": effective, "chosen": chosen.map(|(m, _)| m), "once": chosen.map(|(_, once)| once).unwrap_or(false),
+            "default": profile.modes.default, "cap": profile.modes.cap,
+            "capped_from": asked.filter(|m| m.stricter(profile.modes.cap) != *m),
+        })
+    }
+
+    /// A request that names no mode takes the one chosen for this session; a mode chosen
+    /// "once" is used up by the ticket it starts.
+    fn apply_chosen_mode(&self, request_id: &str, named: bool) {
+        let Some((mode, once)) = self.chosen_mode() else { return };
+        let Some(mut request) = self.store.request_get(request_id) else {
+            return;
+        };
+        if named || request.mode.is_some() {
+            // This ticket names its own mode: a mode chosen "once" waits for the next one.
+            return;
+        }
+        request.mode = Some(mode);
+        self.store.request_save(&request);
+        if once {
+            self.store.kv_set("mode.chosen", "");
+        }
     }
 
     /// A ticket that targets a repository must be created with it, or its worker
@@ -1124,6 +1180,8 @@ impl Daemon {
             // Outside text (an issue, a mail) is data: it never becomes work without a judgement.
             return Ok(None);
         }
+        self.apply_chosen_mode(request_id, request.mode.is_some());
+        let request = self.store.request_get(request_id).unwrap_or(request);
         let title: String = request.text.lines().next().unwrap_or("").chars().take(72).collect();
         let outcome = Outcome::Accept {
             title,
@@ -1215,8 +1273,9 @@ impl Daemon {
         if let Some(eval) = self.store.eval_by_request(request_id) {
             self.engine.candidate_delivered(&eval.id)?;
         }
-        if let Outcome::Accept { title, .. } = &outcome {
+        if let Outcome::Accept { title, mode, .. } = &outcome {
             self.settle_project(request_id, opt_param(params, "project"), title);
+            self.apply_chosen_mode(request_id, mode.is_some());
         }
         let decision = self.engine.decide(request_id, DecisionInput { eval_id, outcome })?;
         self.register(true);

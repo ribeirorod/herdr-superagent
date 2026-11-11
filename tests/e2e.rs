@@ -807,3 +807,161 @@ fn imports_are_cleaned_of_hooks_probes_and_duplicates_and_curated_notes_take_the
     assert_eq!(world.cli(&["memory", "notes"])["removed"], 1);
     assert_eq!(world.cli(&["status"])["memory"], 0);
 }
+
+#[test]
+fn the_mode_of_the_next_ticket_is_switched_in_the_session_and_capped_by_the_profile() {
+    let world = world("id = \"e2e\"\ncalibrated = true\n");
+    assert_eq!(world.cli(&["mode"])["effective"], "checkpoint", "the profile's default");
+    // "Do the next one autonomously."
+    let once = world.cli(&["mode", "autonomous", "--once"]);
+    assert_eq!(
+        (once["effective"].as_str(), once["once"].as_bool()),
+        (Some("autonomous"), Some(true))
+    );
+    let mode_of = |text: &str, extra: &[&str]| {
+        let mut args = vec!["submit", text, "--workflow", "general"];
+        args.extend(extra);
+        let ticket = world.cli(&args)["ticket_id"].as_str().unwrap().to_string();
+        world.cli(&["ticket", &ticket])["mode"].as_str().unwrap().to_string()
+    };
+    // A ticket that names its own mode does not use the choice up.
+    assert_eq!(
+        mode_of("Summarise the changelog of the last release", &["--mode", "propose"]),
+        "propose"
+    );
+    assert_eq!(mode_of("Tidy the notes folder into one index file", &[]), "autonomous");
+    assert_eq!(
+        mode_of("Check which of the scripts are still used", &[]),
+        "checkpoint",
+        "once means once"
+    );
+    // "Plan only from now on", until "back to normal".
+    world.cli(&["mode", "propose"]);
+    assert_eq!(mode_of("Draft the outline of the migration guide", &[]), "propose");
+    assert_eq!(mode_of("List the open questions about the importer", &[]), "propose");
+    assert_eq!(world.cli(&["status"])["mode"]["chosen"], "propose");
+    world.cli(&["mode", "default"]);
+    assert_eq!(mode_of("Count the lines of every source file here", &[]), "checkpoint");
+    // The profile's cap wins over what the session asks for.
+    world.cli(&["profile", "set", "modes.cap=checkpoint", "--yes"]);
+    let capped = world.cli(&["mode", "autonomous"]);
+    assert_eq!(
+        (capped["effective"].as_str(), capped["capped_from"].as_str()),
+        (Some("checkpoint"), Some("autonomous"))
+    );
+    assert_eq!(mode_of("Rename the examples to match the new names", &[]), "checkpoint");
+}
+
+#[test]
+fn no_protected_branch_is_pushed_without_approval_even_past_the_shims() {
+    let world = world("id = \"e2e\"\ncalibrated = true\n");
+    let repo = repo(&world);
+    // A remote, and a hook of the repository's own that must keep running.
+    let origin = world.dir.path().join("origin.git");
+    git(world.dir.path(), &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+    git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    let marker = world.dir.path().join("own-hook-ran");
+    let own_hook = repo.join(".git/hooks/pre-push");
+    std::fs::write(
+        &own_hook,
+        format!("#!/bin/sh\ncat > /dev/null\necho ran >> '{}'\n", marker.display()),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&own_hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Checkpoint mode: the rails are not only for autonomous workers.
+    let submitted = world.cli(&[
+        "submit",
+        "Fix the typo in the README",
+        "--workflow",
+        "general",
+        "--project",
+        repo.to_str().unwrap(),
+    ]);
+    let ticket_id = submitted["ticket_id"].as_str().unwrap().to_string();
+    let ticket = world.wait("the worker", || {
+        let ticket = world.cli(&["ticket", &ticket_id]);
+        ticket["assignments"][0]["pane_id"].is_string().then_some(ticket)
+    });
+    assert_eq!(ticket["mode"], "checkpoint");
+    let worktree = PathBuf::from(ticket["execution"]["directory"].as_str().unwrap());
+    let branch = ticket["execution"]["branch"].as_str().unwrap().to_string();
+    let hooks = world
+        .dir
+        .path()
+        .join(STATE)
+        .join("profiles/e2e/hooks")
+        .join(ticket_id.trim_start_matches("t-"));
+    let exported = world.calls("pane.send_input").iter().any(|p| {
+        let text = p["text"].as_str().unwrap_or("");
+        text.contains(&format!("GIT_CONFIG_VALUE_0={}", hooks.display())) && text.contains("/shims:")
+    });
+    assert!(exported, "the worker's pane has the hook and the shims in force");
+    std::fs::write(worktree.join("README.md"), "invoices, fixed\n").unwrap();
+    // The worker's shell, but git called by its real path: the shims are not in the way.
+    let real_git = String::from_utf8(Command::new("sh").args(["-c", "command -v git"]).output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let run = |args: &[&str]| {
+        Command::new(&real_git)
+            .args(args)
+            .current_dir(&worktree)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", &hooks)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .env("SUPERAGENT_TICKET", &ticket_id)
+            .env("SUPERAGENT_WORKTREE", &worktree)
+            .env("SUPERAGENT_PROFILE", "e2e")
+            .env("HERDR_SUPERAGENT_STATE_DIR", world.dir.path().join(STATE))
+            .env("HERDR_SUPERAGENT_CONFIG_DIR", world.dir.path().join("config"))
+            .env("HERDR_SOCKET_PATH", &world.herdr_socket)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["commit", "-q", "-am", "fix typo"]).status.success());
+    // Its own branch goes out freely, and the repository's own hook still ran.
+    let own = run(&["push", "-q", "-u", "origin", &branch]);
+    assert!(own.status.success(), "{}", String::from_utf8_lossy(&own.stderr));
+    assert!(marker.exists(), "the repository's own pre-push hook keeps running");
+    // main does not, whichever way it is spelled.
+    let held = run(&["push", "origin", &format!("{branch}:main")]);
+    assert!(!held.status.success());
+    assert!(
+        String::from_utf8_lossy(&held.stderr).contains("held back"),
+        "{}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    let waiting = world.cli(&["ticket", &ticket_id]);
+    assert_eq!(waiting["checkpoint"]["name"], "guard-git");
+    assert!(waiting["checkpoint"]["summary"].as_str().unwrap().contains("refs/heads/main"));
+    let remote_main = || {
+        String::from_utf8(
+            Command::new(&real_git)
+                .args(["-C", origin.to_str().unwrap(), "rev-parse", "main"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+    let before = remote_main();
+    // Approved by the person, exactly that push goes through, once.
+    world.cli(&["approve", &ticket_id]);
+    let allowed = run(&["push", "origin", &format!("{branch}:main")]);
+    assert!(allowed.status.success(), "{}", String::from_utf8_lossy(&allowed.stderr));
+    assert_ne!(remote_main(), before, "main moved only after the approval");
+    std::fs::write(worktree.join("README.md"), "invoices, fixed again\n").unwrap();
+    assert!(run(&["commit", "-q", "-am", "again"]).status.success());
+    assert!(
+        !run(&["push", "origin", "HEAD:refs/heads/main"]).status.success(),
+        "the approval was for one push"
+    );
+}

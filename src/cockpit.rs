@@ -370,6 +370,16 @@ impl App {
                 self.clamp();
             }
             KeyCode::Char('?') => self.help = !self.help,
+            // The mode of the next tickets: default → propose → checkpoint → autonomous → default.
+            KeyCode::Char('m') => {
+                let next = match self.status["mode"]["chosen"].as_str() {
+                    None => "propose",
+                    Some("propose") => "checkpoint",
+                    Some("checkpoint") => "autonomous",
+                    Some(_) => "default",
+                };
+                return Some(Action::Daemon("mode_set", json!({ "mode": next, "once": false })));
+            }
             KeyCode::Esc => self.help = false,
             KeyCode::Enter => return self.act(if self.candidate().is_some() { 'a' } else { 'o' }),
             KeyCode::Char('q') => self.flash = "the cockpit stays open; close the pane to quit".into(),
@@ -650,7 +660,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " · workers {}/{} · to route {} · memory {}{}{}",
+                    " · next: {}{} · workers {}/{} · to route {} · memory {}{}{}",
+                    app.status["mode"]["effective"].as_str().unwrap_or("?"),
+                    match (
+                        app.status["mode"]["chosen"].is_null(),
+                        app.status["mode"]["once"].as_bool().unwrap_or(false)
+                    ) {
+                        (true, _) => "",
+                        (false, true) => " (once)",
+                        (false, false) => " (set)",
+                    },
                     app.status["workers"]["running"],
                     app.status["workers"]["max"],
                     app.status["candidates"],
@@ -727,6 +746,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Line::raw("a  approve the checkpoint      c  send it back with what must change"),
                 Line::raw("n  note to the worker          t  retitle      r  retry      s  stop"),
                 Line::raw("on a request to route:  a  accept (the workflow is chosen for you)   i  ignore"),
+                Line::raw("m  mode of the next tickets: profile default, propose, checkpoint, autonomous"),
                 Line::raw("mouse: click selects, click again opens, wheel moves, footer buttons act"),
             ],
         )
@@ -766,7 +786,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 spans.push(Span::raw("  "));
                 x += len + 2;
             }
-            spans.push(Span::styled("[?] keys", dim));
+            spans.push(Span::styled("[m] mode  [?] keys", dim));
             Line::from(spans)
         }
     };
@@ -876,7 +896,8 @@ mod tests {
         let mut app = App::new("work");
         let now = crate::core::clock::now_iso();
         app.load(
-            json!({ "needs_you": 1, "workers": { "running": 1, "max": 3 }, "candidates": 1, "memory": 4 }),
+            json!({ "needs_you": 1, "workers": { "running": 1, "max": 3 }, "candidates": 1, "memory": 4,
+                "mode": { "effective": "checkpoint", "chosen": null, "once": false } }),
             vec![
                 json!({ "id": "t-run111", "title": "Build the export", "stage": "working", "mode": "autonomous", "updated_at": now,
                     "assignments": [{ "role": "worker", "state": "running", "pane_id": "p2", "report": { "state": "progress", "summary": "half way" } }],
@@ -916,7 +937,7 @@ mod tests {
         assert_eq!(app.ticket().unwrap()["id"], "t-plan22", "the selection starts on what needs you");
         let text = screen(&mut app, 80, 24);
         assert!(
-            text.contains("◆ SUPERAGENT · work") && text.contains("needs you 1 · workers 1/3 · to route 1"),
+            text.contains("◆ SUPERAGENT · work") && text.contains("needs you 1 · next: checkpoint · workers 1/3 · to route 1"),
             "{text}"
         );
         let order: Vec<usize> = ["NEEDS YOU (1)", "TO ROUTE (1)", "RUNNING (1)", "DONE TODAY (1)"]
@@ -966,6 +987,11 @@ mod tests {
                 workspace: Some("w1".into()),
                 pane: Some("p1".into())
             })
+        );
+        // `m` steps the mode of the next tickets.
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('m'))),
+            Some(Action::Daemon("mode_set", json!({ "mode": "propose", "once": false })))
         );
         // A key that does not apply to the selection does nothing.
         assert_eq!(app.on_key(key(KeyCode::Char('r'))), None);

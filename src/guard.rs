@@ -1,45 +1,134 @@
-//! Guard shims for autonomous mode (PLAN §6): thin wrappers on the worker's
-//! PATH for `git`, `gh`, `bb` and `rm` that call `herdr-superagent guard`.
-//! A risky invocation becomes a checkpoint instead of running; everything
-//! else is passed through to the real tool. A guard rail, not a sandbox.
+//! Guard rails for workers, in every mode (PLAN §6). Two layers:
+//!
+//! * shims on the worker's PATH for `git`, `gh`, `bb` and `rm` that call
+//!   `herdr-superagent guard`: a risky invocation becomes a checkpoint instead
+//!   of running, everything else is passed through to the real tool;
+//! * a `pre-push` hook in force for the worker's pane, which git itself runs
+//!   however it was started: no protected branch (the default branch, `main`,
+//!   `master`) is updated on a remote without an approved checkpoint.
+//!
+//! Rails, not a sandbox: the remote's own branch protection is the wall.
 
 use std::path::{Path, PathBuf};
 
 pub const GUARDED: &[&str] = &["git", "gh", "bb", "rm"];
 
+/// A git invocation split into what matters: where it runs, the subcommand, and its arguments.
+struct GitCall<'a> {
+    /// `-C <dir>`: the repository it acts on instead of the current directory.
+    dir: Option<&'a str>,
+    sub: &'a str,
+    args: Vec<&'a str>,
+}
+
+fn git_call<'a>(words: &[&'a str]) -> GitCall<'a> {
+    let mut dir = None;
+    let mut i = 0;
+    while i < words.len() {
+        match words[i] {
+            "-C" => {
+                dir = words.get(i + 1).copied();
+                i += 2;
+            }
+            // Global options that take a value.
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" => i += 2,
+            w if w.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    GitCall {
+        dir,
+        sub: words.get(i).copied().unwrap_or(""),
+        args: words.get(i + 1..).map(|a| a.to_vec()).unwrap_or_default(),
+    }
+}
+
+/// Subcommands that change a repository.
+const GIT_WRITES: &[&str] = &[
+    "add",
+    "am",
+    "apply",
+    "branch",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "stash",
+    "switch",
+    "tag",
+    "update-ref",
+    "worktree",
+];
+
+/// Whether `name` is a branch nobody pushes or merges to without approval.
+fn protected(name: &str, default: &str) -> bool {
+    let name = name.trim_start_matches("refs/heads/");
+    name == default || name == "main" || name == "master"
+}
+
 /// Why an invocation is held back, if it is.
 pub fn risk(tool: &str, args: &[String], worktree: Option<&Path>, default_branch: Option<&str>) -> Option<String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let default = default_branch.unwrap_or("main");
     match tool {
         "git" => {
-            let sub = words.iter().find(|w| !w.starts_with('-')).copied().unwrap_or("");
-            match sub {
+            let call = git_call(&words);
+            let has = |flags: &[&str]| call.args.iter().any(|w| flags.contains(w));
+            // Writing to another checkout (the person's own) is never the worker's to do.
+            if let (Some(dir), Some(worktree)) = (call.dir, worktree) {
+                let target = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+                let home = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+                if !target.starts_with(&home) && GIT_WRITES.contains(&call.sub) {
+                    return Some(format!("git {} in {dir}, outside the ticket's worktree", call.sub));
+                }
+            }
+            let here = call.dir.map(Path::new).or(worktree);
+            match call.sub {
                 "push" => {
-                    if words
+                    if call
+                        .args
                         .iter()
                         .any(|w| *w == "--force" || *w == "-f" || w.starts_with("--force-with-lease") || *w == "--delete" || *w == "-d")
                     {
                         return Some("git push with --force or --delete".into());
                     }
-                    let default = default_branch.unwrap_or("main");
-                    let targets: Vec<&str> = words
-                        .iter()
-                        .skip_while(|w| **w != "push")
-                        .skip(1)
-                        .filter(|w| !w.starts_with('-'))
-                        .copied()
-                        .collect();
-                    // `git push origin main`, `git push origin HEAD:main`, or a bare push while on the default branch.
-                    let to_default = targets
+                    if has(&["--all", "--mirror", "--branches"]) {
+                        return Some("git push of every branch".into());
+                    }
+                    let targets: Vec<&str> = call.args.iter().filter(|w| !w.starts_with('-')).copied().collect();
+                    // `git push origin main`, `git push origin HEAD:main`, or a bare push while on a protected branch.
+                    let named = targets
                         .iter()
                         .skip(1)
-                        .any(|t| t.rsplit(':').next() == Some(default) || *t == default || t.rsplit(':').next() == Some("master"))
-                        || (targets.len() <= 1 && default_branch_is_current(worktree, default));
-                    to_default.then(|| format!("git push to the default branch ({default})"))
+                        .any(|t| protected(t.rsplit(':').next().unwrap_or(t).trim_start_matches('+'), default));
+                    let implied = targets.len() <= 1 && on_protected_branch(here, default);
+                    (named || implied).then(|| format!("git push to a protected branch ({default})"))
                 }
-                "reset" if words.contains(&"--hard") => Some("git reset --hard".into()),
-                "clean" if words.iter().any(|w| w.starts_with("-f") || w.starts_with("-x")) => Some("git clean -f".into()),
-                "branch" if words.iter().any(|w| *w == "-D" || *w == "--delete" || *w == "-d") => Some("git branch delete".into()),
+                // Anything that moves a protected branch locally: the next push would carry it.
+                "merge" | "rebase" | "commit" | "cherry-pick" | "revert" | "pull" | "am" if on_protected_branch(here, default) => {
+                    Some(format!("git {} on a protected branch ({default})", call.sub))
+                }
+                "update-ref" if call.args.iter().any(|w| protected(w, default) && w.starts_with("refs/heads/")) => {
+                    Some("git update-ref of a protected branch".into())
+                }
+                "branch" if has(&["-f", "--force", "-M"]) && call.args.iter().any(|w| protected(w, default)) => {
+                    Some("git branch -f on a protected branch".into())
+                }
+                "checkout" | "switch" if has(&["-B", "-C", "--force-create"]) && call.args.iter().any(|w| protected(w, default)) => {
+                    Some("resetting a protected branch".into())
+                }
+                "reset" if has(&["--hard"]) => Some("git reset --hard".into()),
+                "clean" if call.args.iter().any(|w| w.starts_with("-f") || w.starts_with("-x")) => Some("git clean -f".into()),
+                "branch" if has(&["-D", "--delete", "-d"]) => Some("git branch delete".into()),
                 _ => None,
             }
         }
@@ -47,13 +136,18 @@ pub fn risk(tool: &str, args: &[String], worktree: Option<&Path>, default_branch
             let joined = words.join(" ");
             let risky = [
                 "pr merge",
+                "pullrequest merge",
                 "repo delete",
                 "release create",
                 "repo create",
                 "secret set",
                 "workflow run",
             ];
-            risky.iter().find(|r| joined.starts_with(*r)).map(|r| format!("{tool} {r}"))
+            if let Some(r) = risky.iter().find(|r| joined.starts_with(*r)) {
+                return Some(format!("{tool} {r}"));
+            }
+            // The same merge through the raw API.
+            (words.first() == Some(&"api") && joined.contains("/merge")).then(|| format!("{tool} api merge"))
         }
         "rm" => {
             let recursive = words.iter().any(|w| w.starts_with('-') && (w.contains('r') || w.contains('R')));
@@ -82,13 +176,98 @@ pub fn risk(tool: &str, args: &[String], worktree: Option<&Path>, default_branch
     }
 }
 
-fn default_branch_is_current(worktree: Option<&Path>, default: &str) -> bool {
-    let Some(dir) = worktree else { return false };
+/// What a push would update, from the lines git gives a pre-push hook
+/// (`<local ref> <local sha> <remote ref> <remote sha>`): the protected branches among them.
+pub fn protected_pushes(hook_input: &str, default: &str) -> Vec<String> {
+    hook_input
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .filter(|remote| remote.starts_with("refs/heads/") && protected(remote, default))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Client-side hooks git knows; each gets a wrapper so the repository's own keep running.
+const HOOKS: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "post-rewrite",
+    "pre-auto-gc",
+    "reference-transaction",
+];
+
+/// Writes a hooks directory for a ticket: a `pre-push` that asks the guard before a
+/// protected branch is updated, and wrappers that run the repository's own hooks.
+/// It is put in force for the worker's pane only, through git's environment, so the
+/// repository itself is not touched.
+pub fn write_hooks(dir: &Path, binary: &str, repo: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    // Where the repository's own hooks are: its configured path, else `.git/hooks`.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env_remove("GIT_CONFIG_COUNT")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let own = match git(&["config", "--get", "core.hooksPath"]) {
+        Some(path) if Path::new(&path).is_absolute() => format!("'{path}'"),
+        // A relative path is relative to the top of whichever checkout runs the hook.
+        Some(path) => format!("\"$(git rev-parse --show-toplevel)\"/'{path}'"),
+        None => {
+            let common = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .unwrap_or_else(|| repo.join(".git").display().to_string());
+            format!("'{common}/hooks'")
+        }
+    };
+    for name in HOOKS {
+        let guard = if *name == "pre-push" {
+            format!("input=$(cat)\nprintf '%s\\n' \"$input\" | '{binary}' guard-push \"$@\" || exit 1\n")
+        } else {
+            String::new()
+        };
+        let pass = if *name == "pre-push" {
+            "printf '%s\\n' \"$input\" | \"$own\" \"$@\"".to_string()
+        } else {
+            "exec \"$own\" \"$@\"".to_string()
+        };
+        let script = format!(
+            "#!/bin/sh\n# herdr-superagent: protected branches are not pushed without approval; the repository's own hook runs after.\n{guard}own={own}/{name}\nif [ -x \"$own\" ]; then\n  {pass}\nfi\n"
+        );
+        let path = dir.join(name);
+        std::fs::write(&path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(dir.to_path_buf())
+}
+
+/// Whether the checkout at `dir` has a protected branch checked out.
+fn on_protected_branch(dir: Option<&Path>, default: &str) -> bool {
+    let Some(dir) = dir else { return false };
     std::process::Command::new("git")
         .args(["-C", &dir.display().to_string(), "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == default)
+        .map(|o| protected(String::from_utf8_lossy(&o.stdout).trim(), default))
         .unwrap_or(false)
 }
 
@@ -179,6 +358,49 @@ mod tests {
             "the worktree itself"
         );
         assert!(risk("rm", &a(&["file.txt"]), Some(dir.path()), None).is_none());
+        // The repository is named with -C: the subcommand is still found, and writes elsewhere are held.
+        assert!(risk("git", &a(&["-C", ".", "push", "origin", "main"]), None, Some("main")).is_some());
+        assert!(
+            risk(
+                "git",
+                &a(&["-c", "user.name=x", "push", "origin", "HEAD:refs/heads/master"]),
+                None,
+                Some("develop")
+            )
+            .is_some(),
+            "main and master are protected whatever the default is"
+        );
+        assert!(risk("git", &a(&["push", "origin", "develop"]), None, Some("develop")).is_some());
+        assert!(risk("git", &a(&["push", "--all", "origin"]), None, Some("main")).is_some());
+        assert!(risk("git", &a(&["push", "origin", "+sa/1:main"]), None, Some("main")).is_some());
+        assert!(risk(
+            "git",
+            &a(&["-C", "/somewhere/else", "commit", "-m", "x"]),
+            Some(dir.path()),
+            Some("main")
+        )
+        .is_some());
+        assert!(
+            risk("git", &a(&["-C", "/somewhere/else", "log"]), Some(dir.path()), Some("main")).is_none(),
+            "reading elsewhere is fine"
+        );
+        assert!(risk("git", &a(&["update-ref", "refs/heads/main", "HEAD"]), None, Some("main")).is_some());
+        assert!(risk("git", &a(&["branch", "-f", "main", "HEAD"]), None, Some("main")).is_some());
+        assert!(risk("git", &a(&["switch", "-C", "main"]), None, Some("main")).is_some());
+        assert!(risk("git", &a(&["switch", "-c", "feature/x"]), None, Some("main")).is_none());
+        assert!(risk("gh", &a(&["api", "-X", "PUT", "repos/o/r/pulls/3/merge"]), None, None).is_some());
+        assert!(
+            risk("gh", &a(&["pr", "create", "--fill"]), None, None).is_none(),
+            "opening a pull request is how work is delivered"
+        );
+        assert_eq!(
+            protected_pushes(
+                "refs/heads/sa/1 abc refs/heads/sa/1 000\nrefs/heads/sa/1 abc refs/heads/main def\nrefs/tags/v1 abc refs/tags/v1 000\n",
+                "main"
+            ),
+            vec!["refs/heads/main"]
+        );
+        assert!(protected_pushes("refs/heads/sa/1 abc refs/heads/sa/1 000\n", "main").is_empty());
         let shims = write_shims(&dir.path().join("shims"), "/usr/local/bin/herdr-superagent").unwrap();
         assert!(shims.join("git").is_file());
         assert!(std::fs::read_to_string(shims.join("rm")).unwrap().contains("guard rm --"));

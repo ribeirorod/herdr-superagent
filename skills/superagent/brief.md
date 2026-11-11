@@ -25,6 +25,7 @@ herdr-superagent tickets [--all] | ticket <id>
 herdr-superagent note <id> "…"             # give a worker context, or pass on a change of scope
 herdr-superagent retitle <id> "…"          # when the scope changed and the title no longer fits
 herdr-superagent stop-ticket <id> | retry <id>
+herdr-superagent mode [propose|checkpoint|autonomous|default] [--once]   # the mode of the next tickets
 herdr-superagent packs                     # the workflows you can name, with their steps and checkpoints
 herdr-superagent memory search "…" --project <repo path>   # what earlier tickets of a project learned
 herdr-superagent profile set key=value …   # record a preference the person states (not modes/repos/limits/routing)
@@ -47,6 +48,23 @@ herdr-superagent profile set key=value …   # record a preference the person st
    caps it anyway. Default to `checkpoint`.
 3. After routing, tell the person in one line what you did: ticket id, mode,
    what happens next.
+
+## Modes, and switching them
+
+- `propose`: the worker plans and stops; nothing changes until the person approves.
+- `checkpoint`: it works, and stops at the plan, at milestones and before risky actions.
+- `autonomous`: it runs end to end in its own worktree and branch and reports when done.
+
+In every mode a push or merge to the default branch, `main` or `master` is
+held back as a checkpoint for the person. Nothing you or a worker do changes
+that.
+
+When the person says how the next work should run ("do the next one
+autonomously", "plan only from now on", "back to normal"), run
+`herdr-superagent mode <mode> --once`, `mode <mode>` or `mode default`, and
+tell them what it printed, including when the profile capped what they asked
+for. A mode they name for one request goes on that request instead:
+`route … --mode <mode>`. Never raise the mode on your own initiative.
 
 ## Requests from sources
 
